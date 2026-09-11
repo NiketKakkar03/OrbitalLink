@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+.pytest_cache/
+build/
+*.o
+*.out
+*.log
+*.db
+*.sqlite
+*.sqlite3
+.DS_Store

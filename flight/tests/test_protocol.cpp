@@ -1,0 +1,222 @@
+#include "../orbit_protocol.hpp"
+
+#include <cassert>
+#include <cctype>
+#include <cstdint>
+#include <iostream>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+namespace {
+
+constexpr const char* kGoldenFrameHex =
+    "4f4c4e4b01010000001c00000000002c00000000000000010000000000000001"
+    "0102030405060708000000000000002a000000070000006300000000499602d2"
+    "ffffeb7e00000ce4";
+
+std::uint8_t hex_value(char ch) {
+    if (ch >= '0' && ch <= '9') {
+        return static_cast<std::uint8_t>(ch - '0');
+    }
+    if (ch >= 'a' && ch <= 'f') {
+        return static_cast<std::uint8_t>(ch - 'a' + 10);
+    }
+    if (ch >= 'A' && ch <= 'F') {
+        return static_cast<std::uint8_t>(ch - 'A' + 10);
+    }
+    throw std::invalid_argument("invalid hex character");
+}
+
+std::vector<std::uint8_t> from_hex(const std::string& hex) {
+    if (hex.size() % 2 != 0) {
+        throw std::invalid_argument("hex input has odd length");
+    }
+
+    std::vector<std::uint8_t> bytes;
+    bytes.reserve(hex.size() / 2);
+    for (std::size_t i = 0; i < hex.size(); i += 2) {
+        bytes.push_back(static_cast<std::uint8_t>((hex_value(hex[i]) << 4) | hex_value(hex[i + 1])));
+    }
+    return bytes;
+}
+
+std::string to_hex(const std::vector<std::uint8_t>& bytes) {
+    constexpr char kHex[] = "0123456789abcdef";
+    std::string out;
+    out.reserve(bytes.size() * 2);
+    for (const auto byte : bytes) {
+        out.push_back(kHex[(byte >> 4) & 0x0f]);
+        out.push_back(kHex[byte & 0x0f]);
+    }
+    return out;
+}
+
+void assert_protocol_error(const std::vector<std::uint8_t>& frame, const std::string& expected_message) {
+    try {
+        (void)orbit::decode_frame(frame);
+        assert(false && "expected ProtocolError");
+    } catch (const orbit::ProtocolError& error) {
+        assert(std::string(error.what()) == expected_message);
+    }
+}
+
+orbit::TelemetrySample golden_sample() {
+    return orbit::TelemetrySample{
+        1,
+        0x0102030405060708ULL,
+        42,
+        7,
+        99,
+        1234567890ULL,
+        -5250,
+        3300,
+    };
+}
+
+void test_decode_golden_telemetry_sample() {
+    const auto frame = from_hex(kGoldenFrameHex);
+    const auto decoded = orbit::decode_frame(frame);
+
+    assert(decoded.header.message_type == 1);
+    assert(decoded.header.payload_length == 44);
+    assert(decoded.header.message_sequence == 1);
+
+    assert(decoded.sample.spacecraft_id == 1);
+    assert(decoded.sample.flight_boot_id == 0x0102030405060708ULL);
+    assert(decoded.sample.telemetry_sequence == 42);
+    assert(decoded.sample.device_generation == 7);
+    assert(decoded.sample.device_sequence == 99);
+    assert(decoded.sample.timestamp_monotonic_ns == 1234567890ULL);
+    assert(decoded.sample.temperature_millideg_c == -5250);
+    assert(decoded.sample.voltage_millivolts == 3300);
+}
+
+void test_encode_golden_telemetry_sample() {
+    const auto encoded = orbit::encode_telemetry_sample(golden_sample(), 1);
+    assert(to_hex(encoded) == kGoldenFrameHex);
+}
+
+void test_rejects_bad_magic() {
+    auto frame = from_hex(kGoldenFrameHex);
+    frame[0] = 'B';
+    frame[1] = 'A';
+    frame[2] = 'D';
+    frame[3] = '!';
+    assert_protocol_error(frame, "bad magic");
+}
+
+void test_rejects_unsupported_version() {
+    auto frame = from_hex(kGoldenFrameHex);
+    frame[4] = 2;
+    assert_protocol_error(frame, "unsupported version");
+}
+
+void test_rejects_unsupported_message_type() {
+    auto frame = from_hex(kGoldenFrameHex);
+    frame[5] = 99;
+    assert_protocol_error(frame, "unsupported message type");
+}
+
+void test_rejects_unsupported_flags() {
+    auto frame = from_hex(kGoldenFrameHex);
+    frame[7] = 1;
+    assert_protocol_error(frame, "unsupported flags");
+}
+
+void test_rejects_truncated_header() {
+    assert_protocol_error(std::vector<std::uint8_t>{'O', 'L', 'N', 'K'}, "truncated header");
+}
+
+void test_rejects_truncated_payload() {
+    auto frame = from_hex(kGoldenFrameHex);
+    frame.pop_back();
+    assert_protocol_error(frame, "truncated payload");
+}
+
+void test_rejects_bad_payload_length() {
+    auto frame = from_hex(kGoldenFrameHex);
+    frame[15] = 43;
+    assert_protocol_error(frame, "bad telemetry payload length");
+}
+
+void test_rejects_nonzero_reserved_field() {
+    auto frame = from_hex(kGoldenFrameHex);
+    frame[11] = 1;
+    assert_protocol_error(frame, "reserved field is not zero");
+}
+
+void test_rejects_oversized_payload_length() {
+    auto frame = from_hex(kGoldenFrameHex);
+    frame[14] = 0x10;
+    frame[15] = 0x01;
+    assert_protocol_error(frame, "payload too large");
+}
+
+void test_rejects_trailing_bytes() {
+    auto frame = from_hex(kGoldenFrameHex);
+    frame.push_back(0);
+    assert_protocol_error(frame, "trailing bytes");
+}
+
+void test_parser_accepts_split_chunks() {
+    const auto frame = from_hex(kGoldenFrameHex);
+    orbit::FrameParser parser;
+
+    assert(parser.feed(std::vector<std::uint8_t>(frame.begin(), frame.begin() + 3)).empty());
+    assert(parser.feed(std::vector<std::uint8_t>(frame.begin() + 3, frame.begin() + 28)).empty());
+    const auto decoded = parser.feed(std::vector<std::uint8_t>(frame.begin() + 28, frame.end()));
+
+    assert(decoded.size() == 1);
+    assert(decoded[0].sample.temperature_millideg_c == -5250);
+}
+
+void test_parser_accepts_multiple_frames() {
+    const auto frame = from_hex(kGoldenFrameHex);
+    std::vector<std::uint8_t> doubled = frame;
+    doubled.insert(doubled.end(), frame.begin(), frame.end());
+
+    orbit::FrameParser parser;
+    const auto decoded = parser.feed(doubled);
+
+    assert(decoded.size() == 2);
+    assert(decoded[0].header.message_sequence == 1);
+    assert(decoded[1].header.message_sequence == 1);
+}
+
+void test_parser_rejects_invalid_header_before_waiting_for_payload() {
+    const auto frame = from_hex(kGoldenFrameHex);
+    orbit::FrameParser parser;
+    std::vector<std::uint8_t> header(frame.begin(), frame.begin() + 28);
+    header[4] = 2;
+
+    try {
+        (void)parser.feed(header);
+        assert(false && "expected ProtocolError");
+    } catch (const orbit::ProtocolError& error) {
+        assert(std::string(error.what()) == "unsupported version");
+    }
+}
+
+}  // namespace
+
+int main() {
+    test_decode_golden_telemetry_sample();
+    test_encode_golden_telemetry_sample();
+    test_rejects_bad_magic();
+    test_rejects_unsupported_version();
+    test_rejects_unsupported_message_type();
+    test_rejects_unsupported_flags();
+    test_rejects_truncated_header();
+    test_rejects_truncated_payload();
+    test_rejects_bad_payload_length();
+    test_rejects_nonzero_reserved_field();
+    test_rejects_oversized_payload_length();
+    test_rejects_trailing_bytes();
+    test_parser_accepts_split_chunks();
+    test_parser_accepts_multiple_frames();
+    test_parser_rejects_invalid_header_before_waiting_for_payload();
+
+    std::cout << "C++ protocol tests passed\n";
+    return 0;
+}

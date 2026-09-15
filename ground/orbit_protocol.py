@@ -125,3 +125,55 @@ def decode_frame(frame: bytes) -> tuple[Header, TelemetrySample]:
     )
 
     return header, sample
+
+
+class FrameParser:
+    """Collect stream chunks and return complete decoded frames."""
+
+    def __init__(self) -> None:
+        self._buffer = bytearray()
+
+    def feed(self, chunk: bytes) -> list[tuple[Header, TelemetrySample]]:
+        self._buffer.extend(chunk)
+        frames: list[tuple[Header, TelemetrySample]] = []
+
+        while True:
+            if len(self._buffer) < HEADER_LENGTH:
+                return frames
+
+            (
+                magic,
+                version,
+                message_type,
+                flags,
+                header_length,
+                reserved_a,
+                payload_length,
+                message_sequence,
+                reserved_b,
+            ) = HEADER_STRUCT.unpack(self._buffer[:HEADER_LENGTH])
+
+            if magic != MAGIC:
+                raise ProtocolError("bad magic")
+            if version != VERSION:
+                raise ProtocolError("unsupported version")
+            if message_type != TELEMETRY_SAMPLE:
+                raise ProtocolError("unsupported message type")
+            if flags != 0:
+                raise ProtocolError("unsupported flags")
+            if header_length != HEADER_LENGTH:
+                raise ProtocolError("bad header length")
+            if reserved_a != 0 or reserved_b != 0:
+                raise ProtocolError("reserved field is not zero")
+            if payload_length > MAX_PAYLOAD_LENGTH:
+                raise ProtocolError("payload too large")
+            if payload_length != TELEMETRY_SAMPLE_PAYLOAD_LENGTH:
+                raise ProtocolError("bad telemetry payload length")
+
+            frame_length = HEADER_LENGTH + payload_length
+            if len(self._buffer) < frame_length:
+                return frames
+
+            frame = bytes(self._buffer[:frame_length])
+            del self._buffer[:frame_length]
+            frames.append(decode_frame(frame))

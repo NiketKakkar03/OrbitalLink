@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from ground.orbit_protocol import (
+    FrameParser,
     ProtocolError,
     TelemetrySample,
     decode_frame,
@@ -64,6 +65,33 @@ def test_rejects_bad_magic():
         decode_frame(bytes(frame))
 
 
+def test_rejects_unsupported_version():
+    fixture = load_fixture()
+    frame = bytearray(bytes.fromhex(fixture["frame_hex"]))
+    frame[4] = 2
+
+    with pytest.raises(ProtocolError, match="unsupported version"):
+        decode_frame(bytes(frame))
+
+
+def test_rejects_unsupported_message_type():
+    fixture = load_fixture()
+    frame = bytearray(bytes.fromhex(fixture["frame_hex"]))
+    frame[5] = 99
+
+    with pytest.raises(ProtocolError, match="unsupported message type"):
+        decode_frame(bytes(frame))
+
+
+def test_rejects_unsupported_flags():
+    fixture = load_fixture()
+    frame = bytearray(bytes.fromhex(fixture["frame_hex"]))
+    frame[7] = 1
+
+    with pytest.raises(ProtocolError, match="unsupported flags"):
+        decode_frame(bytes(frame))
+
+
 def test_rejects_truncated_header():
     with pytest.raises(ProtocolError, match="truncated header"):
         decode_frame(b"OLNK")
@@ -85,3 +113,66 @@ def test_rejects_bad_payload_length():
 
     with pytest.raises(ProtocolError, match="bad telemetry payload length"):
         decode_frame(bytes(frame))
+
+
+def test_rejects_nonzero_reserved_field():
+    fixture = load_fixture()
+    frame = bytearray(bytes.fromhex(fixture["frame_hex"]))
+    frame[11] = 1
+
+    with pytest.raises(ProtocolError, match="reserved field is not zero"):
+        decode_frame(bytes(frame))
+
+
+def test_rejects_oversized_payload_length():
+    fixture = load_fixture()
+    frame = bytearray(bytes.fromhex(fixture["frame_hex"]))
+    frame[12:16] = (4097).to_bytes(4, "big")
+
+    with pytest.raises(ProtocolError, match="payload too large"):
+        decode_frame(bytes(frame))
+
+
+def test_rejects_trailing_bytes():
+    fixture = load_fixture()
+    frame = bytes.fromhex(fixture["frame_hex"])
+
+    with pytest.raises(ProtocolError, match="trailing bytes"):
+        decode_frame(frame + b"\x00")
+
+
+def test_parser_accepts_split_chunks():
+    fixture = load_fixture()
+    frame = bytes.fromhex(fixture["frame_hex"])
+    parser = FrameParser()
+
+    assert parser.feed(frame[:3]) == []
+    assert parser.feed(frame[3:28]) == []
+    decoded = parser.feed(frame[28:])
+
+    assert len(decoded) == 1
+    header, sample = decoded[0]
+    assert header.message_sequence == 1
+    assert sample.temperature_millideg_c == -5250
+
+
+def test_parser_accepts_multiple_frames_in_one_chunk():
+    fixture = load_fixture()
+    frame = bytes.fromhex(fixture["frame_hex"])
+    parser = FrameParser()
+
+    decoded = parser.feed(frame + frame)
+
+    assert len(decoded) == 2
+    assert decoded[0][1].telemetry_sequence == 42
+    assert decoded[1][1].telemetry_sequence == 42
+
+
+def test_parser_rejects_invalid_header_before_waiting_for_payload():
+    fixture = load_fixture()
+    frame = bytearray(bytes.fromhex(fixture["frame_hex"]))
+    frame[0:4] = b"BAD!"
+    parser = FrameParser()
+
+    with pytest.raises(ProtocolError, match="bad magic"):
+        parser.feed(bytes(frame[:28]))

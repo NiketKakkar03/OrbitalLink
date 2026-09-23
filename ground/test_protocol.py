@@ -4,19 +4,40 @@ from pathlib import Path
 import pytest
 
 from ground.orbit_protocol import (
+    COMMAND_REQUEST,
+    COMMAND_RESULT,
+    COMMAND_SESSION,
     FrameParser,
     ProtocolError,
+    CommandRequest,
+    CommandResult,
+    CommandSession,
+    TelemetryAck,
     TelemetrySample,
     decode_frame,
+    encode_command_request,
+    encode_command_result,
+    encode_command_session,
+    encode_telemetry_ack,
     encode_telemetry_sample,
 )
 
 
 FIXTURE_PATH = Path(__file__).resolve().parents[1] / "protocol" / "fixtures" / "telemetry_sample_v1.json"
+ACK_FIXTURE_PATH = Path(__file__).resolve().parents[1] / "protocol" / "fixtures" / "telemetry_ack_v1.json"
+COMMAND_FIXTURE_PATH = Path(__file__).resolve().parents[1] / "protocol" / "fixtures" / "command_v1.json"
 
 
 def load_fixture():
     return json.loads(FIXTURE_PATH.read_text())
+
+
+def load_ack_fixture():
+    return json.loads(ACK_FIXTURE_PATH.read_text())
+
+
+def load_command_fixture():
+    return json.loads(COMMAND_FIXTURE_PATH.read_text())
 
 
 def test_decode_golden_telemetry_sample():
@@ -168,6 +189,24 @@ def test_parser_accepts_multiple_frames_in_one_chunk():
     assert decoded[1][1].telemetry_sequence == 42
 
 
+def test_parser_accepts_every_single_split_point_for_all_golden_frames():
+    fixture = load_command_fixture()
+    frames = [
+        bytes.fromhex(load_fixture()["frame_hex"]),
+        bytes.fromhex(load_ack_fixture()["frame_hex"]),
+        bytes.fromhex(fixture["request_frame_hex"]),
+        bytes.fromhex(fixture["result_frame_hex"]),
+        bytes.fromhex(fixture["session_frame_hex"]),
+    ]
+    for frame in frames:
+        for split in range(1, len(frame)):
+            parser = FrameParser()
+            assert parser.feed(frame[:split]) == []
+            decoded = parser.feed(frame[split:])
+            assert len(decoded) == 1
+            parser.finish()
+
+
 def test_parser_rejects_invalid_header_before_waiting_for_payload():
     fixture = load_fixture()
     frame = bytearray(bytes.fromhex(fixture["frame_hex"]))
@@ -176,3 +215,98 @@ def test_parser_rejects_invalid_header_before_waiting_for_payload():
 
     with pytest.raises(ProtocolError, match="bad magic"):
         parser.feed(bytes(frame[:28]))
+
+
+def test_parser_rejects_eof_during_frame():
+    frame = bytes.fromhex(load_fixture()["frame_hex"])
+    parser = FrameParser()
+
+    assert parser.feed(frame[:-1]) == []
+    with pytest.raises(ProtocolError, match="truncated frame at end of stream"):
+        parser.finish()
+
+
+def test_parser_accepts_clean_eof():
+    parser = FrameParser()
+    parser.feed(bytes.fromhex(load_fixture()["frame_hex"]))
+
+    parser.finish()
+
+
+def test_encode_and_decode_telemetry_ack():
+    fixture = load_ack_fixture()
+    ack = TelemetryAck(
+        spacecraft_id=fixture["ack"]["spacecraft_id"],
+        flight_boot_id=int(fixture["ack"]["flight_boot_id_hex"], 16),
+        telemetry_sequence=fixture["ack"]["telemetry_sequence"],
+    )
+
+    frame = encode_telemetry_ack(ack, message_sequence=2)
+    header, decoded = decode_frame(frame)
+
+    assert frame.hex() == fixture["frame_hex"]
+    assert header.message_type == 2
+    assert header.payload_length == 20
+    assert header.message_sequence == 2
+    assert decoded == ack
+
+
+def test_parser_accepts_sample_followed_by_ack():
+    sample_frame = bytes.fromhex(load_fixture()["frame_hex"])
+    ack = TelemetryAck(1, int("0102030405060708", 16), 42)
+    ack_frame = encode_telemetry_ack(ack, message_sequence=2)
+    parser = FrameParser()
+
+    decoded = parser.feed(sample_frame + ack_frame)
+
+    assert len(decoded) == 2
+    assert isinstance(decoded[0][1], TelemetrySample)
+    assert decoded[1][1] == ack
+
+
+def test_rejects_bad_ack_payload_length():
+    frame = bytearray(encode_telemetry_ack(TelemetryAck(1, 2, 3)))
+    frame[15] = 19
+
+    with pytest.raises(ProtocolError, match="bad telemetry ACK payload length"):
+        decode_frame(bytes(frame))
+
+
+def test_encode_and_decode_command_request_and_result():
+    request = CommandRequest(0xABCDEF, 1, 99, 3, 10_000, 250, 1)
+    result = CommandResult(0xABCDEF, 1, 99, 3, 0, 0, 7, 8, 250)
+
+    request_frame = encode_command_request(request, message_sequence=10)
+    result_frame = encode_command_result(result, message_sequence=11)
+    fixture = load_command_fixture()
+    assert request_frame.hex() == fixture["request_frame_hex"]
+    assert result_frame.hex() == fixture["result_frame_hex"]
+    request_header, decoded_request = decode_frame(request_frame)
+    result_header, decoded_result = decode_frame(result_frame)
+
+    assert request_header.message_type == COMMAND_REQUEST
+    assert decoded_request == request
+    assert result_header.message_type == COMMAND_RESULT
+    assert decoded_result == result
+
+
+def test_encode_decode_and_stream_command_session():
+    session = CommandSession(0xABCDEF, 0x0102030405060708, 12_345, 1, 16)
+    frame = encode_command_session(session, message_sequence=12)
+    assert frame.hex() == load_command_fixture()["session_frame_hex"]
+    header, decoded = decode_frame(frame)
+
+    assert header.message_type == COMMAND_SESSION
+    assert header.payload_length == 32
+    assert decoded == session
+
+    parser = FrameParser()
+    assert parser.feed(frame[:31]) == []
+    assert parser.feed(frame[31:]) == [(header, session)]
+
+
+def test_rejects_bad_command_session_payload_length():
+    frame = bytearray(encode_command_session(CommandSession(1, 2, 3, 1, 16)))
+    frame[15] = 31
+    with pytest.raises(ProtocolError, match="bad command session payload length"):
+        decode_frame(bytes(frame))

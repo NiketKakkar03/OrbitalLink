@@ -1,6 +1,6 @@
 # OrbitalLink Protocol Specification
 
-Status: draft for M1
+Status: implemented through native milestone M4
 Version: 1
 
 ## 1. Purpose
@@ -80,8 +80,11 @@ Total:
 | 2 | TELEMETRY_ACK | Ground confirms a telemetry sample was stored |
 | 3 | COMMAND_REQUEST | Ground asks flight to do something |
 | 4 | COMMAND_RESULT | Flight reports command result |
+| 5 | COMMAND_SESSION | Flight establishes command replay/deadline context |
 
-M1 only implements `TELEMETRY_SAMPLE`.
+Codecs implement all five message types. The runtime exchanges telemetry,
+sessions, command requests, and command results over mutual TLS 1.3;
+these frame rules remain independent of the transport.
 
 ## 6. TELEMETRY_SAMPLE Payload
 
@@ -104,7 +107,104 @@ Total:
 4 + 8 + 8 + 4 + 4 + 8 + 4 + 4 = 44 bytes
 ```
 
-## 7. Temperature Units
+## 7. TELEMETRY_ACK Payload
+
+The telemetry acknowledgement payload is exactly 20 bytes.
+
+| Offset | Size | Field | Type | Meaning |
+|---:|---:|---|---|---|
+| 0 | 4 | spacecraft_id | unsigned 32-bit | Identifies the spacecraft whose sample was stored |
+| 4 | 8 | flight_boot_id | unsigned 64-bit | Identifies the flight-service run that produced the sample |
+| 12 | 8 | telemetry_sequence | unsigned 64-bit | Identifies the stored sample within that run |
+
+These three fields are the durable identity of a telemetry sample. An ACK is sent only after the
+sample's database transaction commits. The same ACK may be sent for a duplicate sample that is
+already stored. A flight sender must match all three fields before treating its sample as stored;
+the header `message_sequence` alone is not a durable sample identifier.
+
+Total:
+
+```text
+4 + 8 + 8 = 20 bytes
+```
+
+## 8. Temperature Units
+
+## 8. COMMAND_REQUEST Payload
+
+The command request payload is exactly 48 bytes.
+
+| Offset | Size | Field | Type | Meaning |
+|---:|---:|---|---|---|
+| 0 | 8 | command_session_id | unsigned 64-bit | Fresh session for this authenticated connection |
+| 8 | 8 | command_sequence | unsigned 64-bit | Strictly increasing within the session |
+| 16 | 8 | command_id | unsigned 64-bit | Operator correlation identity |
+| 24 | 4 | command_type | unsigned 32-bit | Operation code |
+| 28 | 8 | deadline_monotonic_ms | unsigned 64-bit | Flight monotonic deadline |
+| 36 | 8 | argument | unsigned 64-bit | Operation-specific argument |
+| 44 | 4 | role | unsigned 32-bit | Session-advertised role echoed for audit; authorization comes from the authenticated peer |
+
+Command types:
+
+| Value | Name | Argument |
+|---:|---|---|
+| 1 | enable | must be 0 |
+| 2 | disable | must be 0 |
+| 3 | set-period | period in ms, 10..60000 |
+| 4 | reset | must be 0 |
+| 5 | clear-fault | must be 0 |
+
+## 9. COMMAND_RESULT Payload
+
+The command result payload is exactly 56 bytes.
+
+| Offset | Size | Field | Type | Meaning |
+|---:|---:|---|---|---|
+| 0 | 8 | command_session_id | unsigned 64-bit | Session from the request |
+| 8 | 8 | command_sequence | unsigned 64-bit | Sequence from the request |
+| 16 | 8 | command_id | unsigned 64-bit | Correlation identity from the request |
+| 24 | 4 | command_type | unsigned 32-bit | Operation code from the request |
+| 28 | 4 | status | unsigned 32-bit | `0` accepted, `1` rejected, `2` outcome_unknown |
+| 32 | 4 | reason | unsigned 32-bit | Rejection/unknown reason, or 0 |
+| 36 | 8 | effect_counter | unsigned 64-bit | Device-effect counter after handling |
+| 44 | 8 | device_generation | unsigned 64-bit | Device generation after handling |
+| 52 | 4 | current_period_ms | unsigned 32-bit | Current sample period |
+
+Rejection reasons:
+
+| Value | Name |
+|---:|---|
+| 1 | unauthorized |
+| 2 | bad_session |
+| 3 | bad_sequence |
+| 4 | expired |
+| 5 | bad_arguments |
+| 6 | queue_full |
+
+Rejected commands must not change the device-effect counter. Duplicate commands
+inside a live session report a cached result when known and never repeat the
+device effect. After reconnect or restart, the previous command session is
+stale; lost result acknowledgement is treated as an uncertain outcome rather
+than an automatic replay.
+
+## 10. COMMAND_SESSION Payload
+
+The command session payload is exactly 32 bytes and is the first application
+frame sent by flight after each authenticated TLS connection.
+
+| Offset | Size | Field | Type | Meaning |
+|---:|---:|---|---|---|
+| 0 | 8 | command_session_id | unsigned 64-bit | Fresh unpredictable identity for this connection |
+| 8 | 8 | flight_boot_id | unsigned 64-bit | Flight process identity to which the session is bound |
+| 16 | 8 | flight_monotonic_ms | unsigned 64-bit | Flight clock used to construct deadlines |
+| 24 | 4 | authorized_role | unsigned 32-bit | Role derived from the authenticated peer; `1` may control |
+| 28 | 4 | command_queue_capacity | unsigned 32-bit | Maximum concurrent command requests advertised by flight |
+
+Ground estimates the flight monotonic clock from this advertisement and bounds
+each command lifetime. A reconnect creates a new session. Sent commands without
+results become `outcome_unknown`; they are never moved back to the pending queue.
+
+## 11. Temperature Units
 
 Temperature is stored as milli-degrees Celsius.
 
@@ -117,7 +217,7 @@ That means:
 
 We use integers instead of decimal numbers because integers are easier to encode exactly.
 
-## 8. Voltage Units
+## 11. Voltage Units
 
 Voltage is stored as millivolts.
 
@@ -127,7 +227,7 @@ That means:
 3.300 V = 3300 millivolts
 ```
 
-## 9. Golden Telemetry Sample
+## 12. Golden Telemetry Sample
 
 This is the first sample both C++ and Python must understand.
 
@@ -154,7 +254,24 @@ The header values for this sample are:
 | payload_length | 44 |
 | message_sequence | 1 |
 
-## 10. Rejection Rules
+## 13. Golden Telemetry ACK
+
+The golden ACK confirms storage of the golden sample above.
+
+| Field | Value |
+|---|---:|
+| spacecraft_id | 1 |
+| flight_boot_id | 0x0102030405060708 |
+| telemetry_sequence | 42 |
+| header message_sequence | 2 |
+
+Its complete encoded frame in hexadecimal is:
+
+```text
+4f4c4e4b01020000001c000000000014000000000000000200000000000000010102030405060708000000000000002a
+```
+
+## 14. Rejection Rules
 
 A receiver must reject the message if:
 
@@ -169,7 +286,7 @@ A receiver must reject the message if:
 - the input ends before the full header arrives
 - the input ends before the full payload arrives
 
-## 11. M1 Completion Goal
+## 15. Completion Goal
 
 M1 is complete when:
 

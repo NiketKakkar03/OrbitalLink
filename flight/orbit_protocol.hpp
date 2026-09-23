@@ -13,9 +13,34 @@ namespace orbit {
 constexpr std::array<std::uint8_t, 4> kMagic = {'O', 'L', 'N', 'K'};
 constexpr std::uint8_t kVersion = 1;
 constexpr std::uint8_t kTelemetrySample = 1;
+constexpr std::uint8_t kTelemetryAck = 2;
+constexpr std::uint8_t kCommandRequest = 3;
+constexpr std::uint8_t kCommandResult = 4;
+constexpr std::uint8_t kCommandSession = 5;
 constexpr std::uint16_t kHeaderLength = 28;
 constexpr std::uint32_t kMaxPayloadLength = 4096;
 constexpr std::uint32_t kTelemetrySamplePayloadLength = 44;
+constexpr std::uint32_t kTelemetryAckPayloadLength = 20;
+constexpr std::uint32_t kCommandRequestPayloadLength = 48;
+constexpr std::uint32_t kCommandResultPayloadLength = 56;
+constexpr std::uint32_t kCommandSessionPayloadLength = 32;
+
+constexpr std::uint32_t kCommandEnable = 1;
+constexpr std::uint32_t kCommandDisable = 2;
+constexpr std::uint32_t kCommandSetPeriod = 3;
+constexpr std::uint32_t kCommandReset = 4;
+constexpr std::uint32_t kCommandClearFault = 5;
+
+constexpr std::uint32_t kResultAccepted = 0;
+constexpr std::uint32_t kResultRejected = 1;
+constexpr std::uint32_t kResultOutcomeUnknown = 2;
+
+constexpr std::uint32_t kRejectUnauthorized = 1;
+constexpr std::uint32_t kRejectBadSession = 2;
+constexpr std::uint32_t kRejectBadSequence = 3;
+constexpr std::uint32_t kRejectExpired = 4;
+constexpr std::uint32_t kRejectBadArguments = 5;
+constexpr std::uint32_t kRejectQueueFull = 6;
 
 struct Header {
     std::uint8_t message_type{};
@@ -34,9 +59,49 @@ struct TelemetrySample {
     std::uint32_t voltage_millivolts{};
 };
 
+struct TelemetryAck {
+    std::uint32_t spacecraft_id{};
+    std::uint64_t flight_boot_id{};
+    std::uint64_t telemetry_sequence{};
+};
+
+struct CommandRequest {
+    std::uint64_t command_session_id{};
+    std::uint64_t command_sequence{};
+    std::uint64_t command_id{};
+    std::uint32_t command_type{};
+    std::uint64_t deadline_monotonic_ms{};
+    std::uint64_t argument{};
+    std::uint32_t role{1};
+};
+
+struct CommandResult {
+    std::uint64_t command_session_id{};
+    std::uint64_t command_sequence{};
+    std::uint64_t command_id{};
+    std::uint32_t command_type{};
+    std::uint32_t status{};
+    std::uint32_t reason{};
+    std::uint64_t effect_counter{};
+    std::uint64_t device_generation{};
+    std::uint32_t current_period_ms{};
+};
+
+struct CommandSession {
+    std::uint64_t command_session_id{};
+    std::uint64_t flight_boot_id{};
+    std::uint64_t flight_monotonic_ms{};
+    std::uint32_t authorized_role{};
+    std::uint32_t command_queue_capacity{};
+};
+
 struct DecodedFrame {
     Header header;
     TelemetrySample sample;
+    TelemetryAck ack;
+    CommandRequest command_request;
+    CommandResult command_result;
+    CommandSession command_session;
 };
 
 class ProtocolError : public std::runtime_error {
@@ -117,6 +182,85 @@ inline std::vector<std::uint8_t> encode_telemetry_sample(const TelemetrySample& 
     return out;
 }
 
+inline void append_header(std::vector<std::uint8_t>& out, std::uint8_t message_type,
+                          std::uint32_t payload_length, std::uint64_t message_sequence) {
+    out.insert(out.end(), kMagic.begin(), kMagic.end());
+    out.push_back(kVersion);
+    out.push_back(message_type);
+    append_u16(out, 0);
+    append_u16(out, kHeaderLength);
+    append_u16(out, 0);
+    append_u32(out, payload_length);
+    append_u64(out, message_sequence);
+    append_u32(out, 0);
+}
+
+inline std::vector<std::uint8_t> encode_telemetry_ack(const TelemetryAck& ack,
+                                                      std::uint64_t message_sequence = 1) {
+    std::vector<std::uint8_t> out;
+    out.reserve(kHeaderLength + kTelemetryAckPayloadLength);
+
+    out.insert(out.end(), kMagic.begin(), kMagic.end());
+    out.push_back(kVersion);
+    out.push_back(kTelemetryAck);
+    append_u16(out, 0);
+    append_u16(out, kHeaderLength);
+    append_u16(out, 0);
+    append_u32(out, kTelemetryAckPayloadLength);
+    append_u64(out, message_sequence);
+    append_u32(out, 0);
+
+    append_u32(out, ack.spacecraft_id);
+    append_u64(out, ack.flight_boot_id);
+    append_u64(out, ack.telemetry_sequence);
+    return out;
+}
+
+inline std::vector<std::uint8_t> encode_command_request(const CommandRequest& command,
+                                                        std::uint64_t message_sequence = 1) {
+    std::vector<std::uint8_t> out;
+    out.reserve(kHeaderLength + kCommandRequestPayloadLength);
+    append_header(out, kCommandRequest, kCommandRequestPayloadLength, message_sequence);
+    append_u64(out, command.command_session_id);
+    append_u64(out, command.command_sequence);
+    append_u64(out, command.command_id);
+    append_u32(out, command.command_type);
+    append_u64(out, command.deadline_monotonic_ms);
+    append_u64(out, command.argument);
+    append_u32(out, command.role);
+    return out;
+}
+
+inline std::vector<std::uint8_t> encode_command_result(const CommandResult& result,
+                                                       std::uint64_t message_sequence = 1) {
+    std::vector<std::uint8_t> out;
+    out.reserve(kHeaderLength + kCommandResultPayloadLength);
+    append_header(out, kCommandResult, kCommandResultPayloadLength, message_sequence);
+    append_u64(out, result.command_session_id);
+    append_u64(out, result.command_sequence);
+    append_u64(out, result.command_id);
+    append_u32(out, result.command_type);
+    append_u32(out, result.status);
+    append_u32(out, result.reason);
+    append_u64(out, result.effect_counter);
+    append_u64(out, result.device_generation);
+    append_u32(out, result.current_period_ms);
+    return out;
+}
+
+inline std::vector<std::uint8_t> encode_command_session(const CommandSession& session,
+                                                        std::uint64_t message_sequence = 1) {
+    std::vector<std::uint8_t> out;
+    out.reserve(kHeaderLength + kCommandSessionPayloadLength);
+    append_header(out, kCommandSession, kCommandSessionPayloadLength, message_sequence);
+    append_u64(out, session.command_session_id);
+    append_u64(out, session.flight_boot_id);
+    append_u64(out, session.flight_monotonic_ms);
+    append_u32(out, session.authorized_role);
+    append_u32(out, session.command_queue_capacity);
+    return out;
+}
+
 inline DecodedFrame decode_frame(const std::vector<std::uint8_t>& frame) {
     if (frame.size() < kHeaderLength) {
         throw ProtocolError("truncated header");
@@ -137,7 +281,9 @@ inline DecodedFrame decode_frame(const std::vector<std::uint8_t>& frame) {
     const auto message_sequence = read_u64(frame, 16);
     const auto reserved_b = read_u32(frame, 24);
 
-    if (message_type != kTelemetrySample) {
+    if (message_type != kTelemetrySample && message_type != kTelemetryAck &&
+        message_type != kCommandRequest && message_type != kCommandResult &&
+        message_type != kCommandSession) {
         throw ProtocolError("unsupported message type");
     }
     if (flags != 0) {
@@ -152,8 +298,20 @@ inline DecodedFrame decode_frame(const std::vector<std::uint8_t>& frame) {
     if (payload_length > kMaxPayloadLength) {
         throw ProtocolError("payload too large");
     }
-    if (payload_length != kTelemetrySamplePayloadLength) {
-        throw ProtocolError("bad telemetry payload length");
+    std::uint32_t expected_payload_length = 0;
+    if (message_type == kTelemetrySample) expected_payload_length = kTelemetrySamplePayloadLength;
+    else if (message_type == kTelemetryAck) expected_payload_length = kTelemetryAckPayloadLength;
+    else if (message_type == kCommandRequest) expected_payload_length = kCommandRequestPayloadLength;
+    else if (message_type == kCommandResult) expected_payload_length = kCommandResultPayloadLength;
+    else expected_payload_length = kCommandSessionPayloadLength;
+    if (payload_length != expected_payload_length) {
+        if (message_type == kTelemetrySample) {
+            throw ProtocolError("bad telemetry payload length");
+        }
+        if (message_type == kTelemetryAck) throw ProtocolError("bad telemetry ACK payload length");
+        if (message_type == kCommandRequest) throw ProtocolError("bad command request payload length");
+        if (message_type == kCommandResult) throw ProtocolError("bad command result payload length");
+        throw ProtocolError("bad command session payload length");
     }
 
     const auto expected_frame_length = kHeaderLength + payload_length;
@@ -166,16 +324,54 @@ inline DecodedFrame decode_frame(const std::vector<std::uint8_t>& frame) {
 
     DecodedFrame decoded;
     decoded.header = Header{message_type, payload_length, message_sequence};
-    decoded.sample = TelemetrySample{
-        read_u32(frame, 28),
-        read_u64(frame, 32),
-        read_u64(frame, 40),
-        read_u32(frame, 48),
-        read_u32(frame, 52),
-        read_u64(frame, 56),
-        read_i32(frame, 64),
-        read_u32(frame, 68),
-    };
+    if (message_type == kTelemetrySample) {
+        decoded.sample = TelemetrySample{
+            read_u32(frame, 28),
+            read_u64(frame, 32),
+            read_u64(frame, 40),
+            read_u32(frame, 48),
+            read_u32(frame, 52),
+            read_u64(frame, 56),
+            read_i32(frame, 64),
+            read_u32(frame, 68),
+        };
+    } else if (message_type == kTelemetryAck) {
+        decoded.ack = TelemetryAck{
+            read_u32(frame, 28),
+            read_u64(frame, 32),
+            read_u64(frame, 40),
+        };
+    } else if (message_type == kCommandRequest) {
+        decoded.command_request = CommandRequest{
+            read_u64(frame, 28),
+            read_u64(frame, 36),
+            read_u64(frame, 44),
+            read_u32(frame, 52),
+            read_u64(frame, 56),
+            read_u64(frame, 64),
+            read_u32(frame, 72),
+        };
+    } else if (message_type == kCommandResult) {
+        decoded.command_result = CommandResult{
+            read_u64(frame, 28),
+            read_u64(frame, 36),
+            read_u64(frame, 44),
+            read_u32(frame, 52),
+            read_u32(frame, 56),
+            read_u32(frame, 60),
+            read_u64(frame, 64),
+            read_u64(frame, 72),
+            read_u32(frame, 80),
+        };
+    } else {
+        decoded.command_session = CommandSession{
+            read_u64(frame, 28),
+            read_u64(frame, 36),
+            read_u64(frame, 44),
+            read_u32(frame, 52),
+            read_u32(frame, 56),
+        };
+    }
     return decoded;
 }
 
@@ -198,7 +394,10 @@ class FrameParser {
             if (buffer_.at(4) != kVersion) {
                 throw ProtocolError("unsupported version");
             }
-            if (buffer_.at(5) != kTelemetrySample) {
+            const auto message_type = buffer_.at(5);
+            if (message_type != kTelemetrySample && message_type != kTelemetryAck &&
+                message_type != kCommandRequest && message_type != kCommandResult &&
+                message_type != kCommandSession) {
                 throw ProtocolError("unsupported message type");
             }
             if (read_u16(buffer_, 6) != 0) {
@@ -215,8 +414,20 @@ class FrameParser {
             if (payload_length > kMaxPayloadLength) {
                 throw ProtocolError("payload too large");
             }
-            if (payload_length != kTelemetrySamplePayloadLength) {
-                throw ProtocolError("bad telemetry payload length");
+            std::uint32_t expected_payload_length = 0;
+            if (message_type == kTelemetrySample) expected_payload_length = kTelemetrySamplePayloadLength;
+            else if (message_type == kTelemetryAck) expected_payload_length = kTelemetryAckPayloadLength;
+            else if (message_type == kCommandRequest) expected_payload_length = kCommandRequestPayloadLength;
+            else if (message_type == kCommandResult) expected_payload_length = kCommandResultPayloadLength;
+            else expected_payload_length = kCommandSessionPayloadLength;
+            if (payload_length != expected_payload_length) {
+                if (message_type == kTelemetrySample) {
+                    throw ProtocolError("bad telemetry payload length");
+                }
+                if (message_type == kTelemetryAck) throw ProtocolError("bad telemetry ACK payload length");
+                if (message_type == kCommandRequest) throw ProtocolError("bad command request payload length");
+                if (message_type == kCommandResult) throw ProtocolError("bad command result payload length");
+                throw ProtocolError("bad command session payload length");
             }
 
             const auto frame_length = kHeaderLength + payload_length;
@@ -227,6 +438,12 @@ class FrameParser {
             std::vector<std::uint8_t> frame(buffer_.begin(), buffer_.begin() + frame_length);
             buffer_.erase(buffer_.begin(), buffer_.begin() + frame_length);
             frames.push_back(decode_frame(frame));
+        }
+    }
+
+    void finish() const {
+        if (!buffer_.empty()) {
+            throw ProtocolError("truncated frame at end of stream");
         }
     }
 

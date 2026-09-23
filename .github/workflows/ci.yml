@@ -1,0 +1,21 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Install native dependencies
+        run: sudo apt-get update && sudo apt-get install -y g++ make libssl-dev
+      - name: Run regression suite
+        run: make check OPENSSL_PREFIX=/usr
+      - name: Run address and undefined behavior sanitizers
+        run: make test-sanitizers OPENSSL_PREFIX=/usr
+      - name: Check patch whitespace
+        run: git diff --check

@@ -1,0 +1,14 @@
+{
+  "description": "Golden OrbitalLink v1 telemetry acknowledgement",
+  "header": {
+    "message_type": 2,
+    "payload_length": 20,
+    "message_sequence": 2
+  },
+  "ack": {
+    "spacecraft_id": 1,
+    "flight_boot_id_hex": "0102030405060708",
+    "telemetry_sequence": 42
+  },
+  "frame_hex": "4f4c4e4b01020000001c000000000014000000000000000200000000000000010102030405060708000000000000002a"
+}

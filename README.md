@@ -1,11 +1,11 @@
 # OrbitalLink
 
 OrbitalLink is a learning project that builds a secure embedded telemetry path in
-small milestones. M3 provides a concurrent native macOS/Linux implementation:
+small milestones. The current implementation runs natively on macOS/Linux:
 
 ```text
 C++ acquisition thread -> bounded retention queue -> C++ network thread
-    -> TCP -> Python ground station -> SQLite commit -> ACK
+    -> TLS/TCP -> Python ground station -> SQLite commit -> ACK
 ```
 
 The normal flight service and ground receiver use mutual TLS 1.3 with explicit
@@ -13,11 +13,12 @@ peer identity authorization. See [security setup](docs/security.md) for the
 authenticated demo. The deterministic sender below uses the explicit loopback
 fixture transport retained for M2/M3 regression tests.
 
-## Verify M0 through M3
+## Verify the native implementation
 
 Create the Python environment described in `docs/environment.md`, then run:
 
 ```bash
+make doctor
 make check
 ```
 
@@ -27,13 +28,27 @@ integration path. The integration test sends 10,000 deterministic samples,
 replays 100 duplicates, and verifies that SQLite contains exactly 10,000 rows.
 It also tests bounded queues, short and overflowing outages, lost and partial
 ACKs, a stalled peer, retry backoff, and bounded shutdown.
+Security tests use real TLS connections and disposable development certificates.
 
 Run the concurrency policy under the supported sanitizers separately:
 
 ```bash
 make test-sanitizers
 make test-tsan
+make test-security-sanitizers
 ```
+
+Run the authenticated automated demo:
+
+```bash
+make demo-native
+```
+
+It starts both native processes, verifies 100 acknowledged samples and their
+exact stored sequence set, and saves the database and process logs under
+`build/native-demo/`. See [security setup](docs/security.md) for manual TLS and
+operator-command use, and [validation evidence](docs/validation.md) for retained
+check results.
 
 ## Run the native path manually
 
@@ -68,7 +83,7 @@ samples are not inserted twice, but are ACKed because their existing row is
 already durable. Structurally valid but physically implausible readings remain
 stored with a validity flag and reason; malformed protocol frames are rejected.
 
-## Run the M3 flight service
+## Run the concurrent flight service
 
 With the TLS receiver and disposable certificates described in
 `docs/security.md`, compile and start the concurrent service:
@@ -129,3 +144,12 @@ The flight backlog exists only in memory. A flight-process crash or restart can
 therefore lose unacknowledged samples. If ground remains unavailable indefinitely,
 the queue stays bounded, old samples are dropped with counters, and shutdown
 discards and accounts for whatever remains.
+
+## Embedded milestone gates
+
+Native M4 is implemented and locally validated; see
+[the M4 journal](docs/journal/session-004.md) for results and limitations.
+Guest and driver prototypes await their own validation. ARM64 guest boot, driver syscall/lifecycle testing,
+custom QEMU MMIO/IRQ acquisition, and the full embedded fault/benchmark suite
+remain separate completion gates. Native tests establish the host telemetry
+path only. See [the roadmap](OrbitalLink_Roadmap.md) for the dependent milestones.

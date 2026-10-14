@@ -1,5 +1,6 @@
 #pragma once
 
+#include "command_policy.hpp"
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -14,6 +15,10 @@ constexpr std::array<std::uint8_t, 4> kMagic = {'O', 'L', 'N', 'K'};
 constexpr std::uint8_t kVersion = 1;
 constexpr std::uint8_t kTelemetrySample = 1;
 constexpr std::uint8_t kTelemetryAck = 2;
+constexpr std::uint8_t kCommandSession = 3, kCommandRequest = 4, kCommandResult = 5;
+inline std::uint32_t payload_size(std::uint8_t type) {
+    switch(type) { case 1:return 44;case 2:return 20;case 3:return 24;case 4:return 40;case 5:return 32;default:throw std::runtime_error("unsupported message type"); }
+}
 constexpr std::uint16_t kHeaderLength = 28;
 constexpr std::uint32_t kMaxPayloadLength = 4096;
 constexpr std::uint32_t kTelemetrySamplePayloadLength = 44;
@@ -46,6 +51,7 @@ struct DecodedFrame {
     Header header;
     TelemetrySample sample;
     TelemetryAck ack;
+    CommandRequest command;
 };
 
 class ProtocolError : public std::runtime_error {
@@ -147,6 +153,18 @@ inline std::vector<std::uint8_t> encode_telemetry_ack(const TelemetryAck& ack,
     return out;
 }
 
+inline std::vector<std::uint8_t> encode_control(std::uint8_t type, const std::vector<std::uint8_t>& payload, std::uint64_t sequence=1) {
+    if (type < 3 || type > 5 || payload.size()!=payload_size(type)) throw ProtocolError("bad command frame");
+    std::vector<std::uint8_t> out(kMagic.begin(),kMagic.end());
+    out.push_back(kVersion);out.push_back(type);append_u16(out,0);append_u16(out,kHeaderLength);append_u16(out,0);
+    append_u32(out,payload.size());append_u64(out,sequence);append_u32(out,0);out.insert(out.end(),payload.begin(),payload.end());return out;
+}
+inline std::vector<std::uint8_t> encode_command_result(const CommandResult& result) {
+    std::vector<std::uint8_t> out;append_u64(out,result.request.session);append_u64(out,result.request.sequence);
+    append_u64(out,result.request.id);append_u32(out,static_cast<std::uint32_t>(result.status));append_u32(out,0);
+    return encode_control(kCommandResult,out,result.request.sequence);
+}
+
 inline DecodedFrame decode_frame(const std::vector<std::uint8_t>& frame) {
     if (frame.size() < kHeaderLength) {
         throw ProtocolError("truncated header");
@@ -167,7 +185,7 @@ inline DecodedFrame decode_frame(const std::vector<std::uint8_t>& frame) {
     const auto message_sequence = read_u64(frame, 16);
     const auto reserved_b = read_u32(frame, 24);
 
-    if (message_type != kTelemetrySample && message_type != kTelemetryAck) {
+    if (message_type < kTelemetrySample || message_type > kCommandResult) {
         throw ProtocolError("unsupported message type");
     }
     if (flags != 0) {
@@ -182,9 +200,7 @@ inline DecodedFrame decode_frame(const std::vector<std::uint8_t>& frame) {
     if (payload_length > kMaxPayloadLength) {
         throw ProtocolError("payload too large");
     }
-    const auto expected_payload_length = message_type == kTelemetrySample
-                                             ? kTelemetrySamplePayloadLength
-                                             : kTelemetryAckPayloadLength;
+    const auto expected_payload_length = payload_size(message_type);
     if (payload_length != expected_payload_length) {
         if (message_type == kTelemetrySample) {
             throw ProtocolError("bad telemetry payload length");
@@ -213,13 +229,14 @@ inline DecodedFrame decode_frame(const std::vector<std::uint8_t>& frame) {
             read_i32(frame, 64),
             read_u32(frame, 68),
         };
-    } else {
+    } else if (message_type == kTelemetryAck) {
         decoded.ack = TelemetryAck{
             read_u32(frame, 28),
             read_u64(frame, 32),
             read_u64(frame, 40),
         };
     }
+    if (message_type == kCommandRequest) decoded.command = CommandRequest{read_u64(frame,28),read_u64(frame,36),read_u64(frame,44),read_u64(frame,52),read_u32(frame,60),read_u32(frame,64)};
     return decoded;
 }
 
@@ -243,7 +260,7 @@ class FrameParser {
                 throw ProtocolError("unsupported version");
             }
             const auto message_type = buffer_.at(5);
-            if (message_type != kTelemetrySample && message_type != kTelemetryAck) {
+            if (message_type < kTelemetrySample || message_type > kCommandResult) {
                 throw ProtocolError("unsupported message type");
             }
             if (read_u16(buffer_, 6) != 0) {
@@ -260,9 +277,7 @@ class FrameParser {
             if (payload_length > kMaxPayloadLength) {
                 throw ProtocolError("payload too large");
             }
-            const auto expected_payload_length = message_type == kTelemetrySample
-                                                     ? kTelemetrySamplePayloadLength
-                                                     : kTelemetryAckPayloadLength;
+            const auto expected_payload_length = payload_size(message_type);
             if (payload_length != expected_payload_length) {
                 if (message_type == kTelemetrySample) {
                     throw ProtocolError("bad telemetry payload length");

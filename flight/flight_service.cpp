@@ -2,6 +2,7 @@
 #include "gap_tracker.hpp"
 #include "retention_queue.hpp"
 #include "retry_policy.hpp"
+#include "command_policy.hpp"
 
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -26,6 +27,7 @@
 #include <vector>
 #ifndef ORBIT_TEST_PLAINTEXT
 #include <openssl/ssl.h>
+#include <openssl/rand.h>
 #include <openssl/err.h>
 #include <openssl/x509v3.h>
 #endif
@@ -34,6 +36,10 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 using Milliseconds = std::chrono::milliseconds;
+
+std::uint64_t monotonic_ns() {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count());
+}
 
 enum class ConnectionState { disconnected, connecting, authenticating, active, backoff, stopping };
 
@@ -50,7 +56,7 @@ const char* state_name(ConnectionState state) {
 }
 
 struct Config {
-    std::string ca, certificate, key, server_name;
+    std::string ca, certificate, key, server_name, authorized_command_server;
     std::string host;
     std::uint16_t port{};
     std::uint64_t count{100};
@@ -65,6 +71,7 @@ struct Config {
         std::uniform_int_distribution<std::uint64_t> distribution;
         return distribution(entropy);
     }()};
+    bool fake_fault{};
     int ready_fd{-1};
 };
 
@@ -92,6 +99,8 @@ struct Shared {
     std::atomic<bool> drain_active{false};
     std::atomic<ConnectionState> state{ConnectionState::disconnected};
     Counters counters;
+    orbit::CommandDispatcher commands;
+    std::atomic<bool> network_done{false};
 };
 
 std::atomic<bool>* signal_stop = nullptr;
@@ -160,12 +169,14 @@ Config parse_args(int argc, char** argv) {
     for (int i = 3; i < argc; i += 2) {
         if (i + 1 >= argc) throw std::invalid_argument(std::string("missing value for ") + argv[i]);
         const std::string option = argv[i];
+        if (option == "--authorized-command-server") { config.authorized_command_server=argv[i+1]; continue; }
         if (option == "--ca") { config.ca = argv[i + 1]; continue; }
         if (option == "--cert") { config.certificate = argv[i + 1]; continue; }
         if (option == "--key") { config.key = argv[i + 1]; continue; }
         if (option == "--server-name") { config.server_name = argv[i + 1]; continue; }
         const auto value = parse_u64(argv[i + 1], option.c_str());
-        if (option == "--count") config.count = value;
+        if (option == "--fake-fault") config.fake_fault = value != 0;
+        else if (option == "--count") config.count = value;
         else if (option == "--interval-ms") config.interval_ms = value;
         else if (option == "--capacity") config.capacity = static_cast<std::size_t>(value);
         else if (option == "--connect-timeout-ms") config.connect_timeout_ms = value;
@@ -214,22 +225,32 @@ orbit::TelemetrySample make_sample(std::uint64_t index, std::uint64_t boot_id) {
 }
 
 void acquisition_loop(const Config& config, Shared& shared) {
+    shared.commands.configure(static_cast<std::uint32_t>(config.interval_ms), config.fake_fault);
     auto next = Clock::now();
-    for (std::uint64_t index = 0; index < config.count && !shared.stop_requested.load(); ++index) {
-        auto sample = make_sample(index, config.boot_id);
+    std::uint32_t device_sequence=0, generation=7;
+    std::uint64_t index=0;
+    while (index < config.count && !shared.stop_requested.load()) {
+        shared.commands.execute(monotonic_ns());
+        const auto device=shared.commands.state();
+        if (device.generation != generation) { generation=device.generation; device_sequence=0; }
+        if (!device.enabled || Clock::now()<next) { std::this_thread::sleep_for(Milliseconds(1));continue; }
+        auto sample = make_sample(index++, config.boot_id);
+        sample.device_generation=generation; sample.device_sequence=device_sequence++;
+        sample.timestamp_monotonic_ns=monotonic_ns();
+        if(device.fault) sample.temperature_millideg_c=200000;
         shared.counters.generated.fetch_add(1);
         const auto displaced = shared.retained.push(sample);
         if (displaced) {
             shared.counters.dropped_oldest.fetch_add(1);
             shared.gaps.record_dropped(displaced->telemetry_sequence);
         }
-        next += Milliseconds(config.interval_ms);
-        while (config.interval_ms != 0 && Clock::now() < next && !shared.stop_requested.load()) {
-            std::this_thread::sleep_for(std::min(Milliseconds(10),
-                                                 std::chrono::duration_cast<Milliseconds>(next - Clock::now())));
-        }
+        next=Clock::now()+Milliseconds(device.period_ms);
     }
     shared.acquisition_done.store(true);
+    while (!shared.network_done.load() && !shared.stop_requested.load()) {
+        shared.commands.execute(monotonic_ns());
+        std::this_thread::sleep_for(Milliseconds(1));
+    }
 }
 
 int wait_fd(int fd, short events, Clock::time_point deadline) {
@@ -348,29 +369,46 @@ bool receive_bytes(Socket& socket, std::vector<std::uint8_t>& bytes, std::size_t
 
 enum class AckResult { valid, receive_failure, invalid };
 
-AckResult require_ack(Socket& socket, const orbit::TelemetrySample& sample, std::uint64_t message_sequence,
-                      std::uint64_t timeout_ms) {
-    const auto deadline = Clock::now() + Milliseconds(timeout_ms);
-    std::vector<std::uint8_t> header;
-    if (!receive_bytes(socket, header, orbit::kHeaderLength, deadline)) return AckResult::receive_failure;
-    const auto payload_length = orbit::read_u32(header, 12);
-    if (payload_length > orbit::kMaxPayloadLength) return AckResult::invalid;
+bool receive_frame(Socket& socket, std::vector<std::uint8_t>& frame, Clock::time_point deadline) {
+    if (!receive_bytes(socket,frame,orbit::kHeaderLength,deadline)) return false;
+    auto size=orbit::read_u32(frame,12);
+    if (size>orbit::kMaxPayloadLength) throw orbit::ProtocolError("payload too large");
     std::vector<std::uint8_t> payload;
-    if (!receive_bytes(socket, payload, payload_length, deadline)) return AckResult::receive_failure;
-    header.insert(header.end(), payload.begin(), payload.end());
-    try {
-        const auto decoded = orbit::decode_frame(header);
-        if (decoded.header.message_type != orbit::kTelemetryAck ||
-            decoded.header.message_sequence != message_sequence ||
-            decoded.ack.spacecraft_id != sample.spacecraft_id ||
-            decoded.ack.flight_boot_id != sample.flight_boot_id ||
-            decoded.ack.telemetry_sequence != sample.telemetry_sequence) {
-            return AckResult::invalid;
-        }
-    } catch (const std::exception&) {
-        return AckResult::invalid;
+    if (!receive_bytes(socket,payload,size,deadline)) return false;
+    frame.insert(frame.end(),payload.begin(),payload.end());return true;
+}
+
+bool dispatch_command(Socket& socket, const orbit::DecodedFrame& frame, Shared& shared, bool authorized, Clock::time_point deadline) {
+    if(frame.header.message_type!=orbit::kCommandRequest) return false;
+    auto status=shared.commands.submit(frame.command,authorized,monotonic_ns());
+    if(status!=orbit::CommandStatus::applied) return send_bytes(socket,orbit::encode_command_result({frame.command,status}),deadline);
+    while(Clock::now()<deadline) {
+        if(auto result=shared.commands.pop_result()) return send_bytes(socket,orbit::encode_command_result(*result),deadline);
+        if(shared.stop_requested.load()) return false;
+        std::this_thread::sleep_for(Milliseconds(1));
     }
-    return AckResult::valid;
+    return false;
+}
+
+AckResult require_ack(Socket& socket, const orbit::TelemetrySample& sample, std::uint64_t message_sequence,
+                      std::uint64_t timeout_ms, Shared& shared, bool authorized) {
+    const auto deadline=Clock::now()+Milliseconds(timeout_ms);
+    try {
+        for (std::size_t count=0;count<17;++count) {
+            std::vector<std::uint8_t> bytes;
+            if(!receive_frame(socket,bytes,deadline)) return AckResult::receive_failure;
+            const auto decoded=orbit::decode_frame(bytes);
+            if(decoded.header.message_type==orbit::kCommandRequest) {
+                if(!dispatch_command(socket,decoded,shared,authorized,deadline)) return AckResult::receive_failure;
+                continue;
+            }
+            if(decoded.header.message_type!=orbit::kTelemetryAck || decoded.header.message_sequence!=message_sequence ||
+               decoded.ack.spacecraft_id!=sample.spacecraft_id || decoded.ack.flight_boot_id!=sample.flight_boot_id ||
+               decoded.ack.telemetry_sequence!=sample.telemetry_sequence) return AckResult::invalid;
+            return AckResult::valid;
+        }
+    } catch(const std::exception&) { return AckResult::invalid; }
+    return AckResult::invalid;
 }
 
 void network_loop(const Config& config, Shared& shared) {
@@ -387,6 +425,8 @@ void network_loop(const Config& config, Shared& shared) {
     }
     SSL_CTX_set_verify(context.get(), SSL_VERIFY_PEER, nullptr);
 #endif
+    struct Completion { Shared& shared; ~Completion() { shared.commands.close(); shared.network_done.store(true); } } completion{shared};
+    bool command_authorized=!config.authorized_command_server.empty() && config.authorized_command_server==config.server_name;
     Socket socket;
     std::uint64_t message_sequence = 1;
     std::uint64_t attempts_for_front = 0;
@@ -430,8 +470,20 @@ void network_loop(const Config& config, Shared& shared) {
             // has explicitly finished: it may have passed its stop check and be
             // immediately about to perform its final push.
             if (shared.acquisition_done.load()) break;
-            std::this_thread::sleep_for(Milliseconds(10));
-            continue;
+#ifndef ORBIT_TEST_PLAINTEXT
+            if(socket) {
+                pollfd descriptor{socket.get(),POLLIN,0};
+                if(SSL_pending(socket.tls)>0 || (::poll(&descriptor,1,0)>0 && descriptor.revents)) {
+                    try {
+                        std::vector<std::uint8_t> bytes;
+                        auto deadline=Clock::now()+Milliseconds(config.io_timeout_ms);
+                        if(!receive_frame(socket,bytes,deadline) || !dispatch_command(socket,orbit::decode_frame(bytes),shared,command_authorized,deadline)) { socket.reset();shared.commands.close(); }
+                    } catch(const std::exception&) { socket.reset();shared.commands.close(); }
+                }
+            }
+#endif
+            std::this_thread::sleep_for(Milliseconds(1));
+            if(socket) continue;
         }
         if (drain_started && Clock::now() >= drain_deadline) {
             if (shared.acquisition_done.load()) break;
@@ -472,9 +524,35 @@ void network_loop(const Config& config, Shared& shared) {
                         throw std::runtime_error("TLS authentication failed");
                 }
 #endif
+#ifndef ORBIT_TEST_PLAINTEXT
+                // Role authorization uses an exact DNS SAN, independently of TLS hostname matching.
+                command_authorized=false;
+                X509* peer=SSL_get1_peer_certificate(socket.tls);
+                if(peer) {
+                    auto* names=static_cast<GENERAL_NAMES*>(X509_get_ext_d2i(peer,NID_subject_alt_name,nullptr,nullptr));
+                    if(names) {
+                        for(int i=0;i<sk_GENERAL_NAME_num(names);++i) {
+                            auto* name=sk_GENERAL_NAME_value(names,i);
+                            if(name->type==GEN_DNS) {
+                                auto* dns=name->d.dNSName;
+                                const std::string identity(reinterpret_cast<const char*>(ASN1_STRING_get0_data(dns)),ASN1_STRING_length(dns));
+                                if(!config.authorized_command_server.empty() && identity==config.authorized_command_server) command_authorized=true;
+                            }
+                        }
+                        GENERAL_NAMES_free(names);
+                    }
+                    X509_free(peer);
+                }
+                std::uint64_t session=0;
+                if(RAND_bytes(reinterpret_cast<unsigned char*>(&session),sizeof(session))!=1 || !session) throw std::runtime_error("session entropy failed");
+                shared.commands.open(session);
+                std::vector<std::uint8_t> announcement;
+                orbit::append_u64(announcement,session);orbit::append_u64(announcement,config.boot_id);orbit::append_u64(announcement,monotonic_ns());
+                if(!send_bytes(socket,orbit::encode_control(orbit::kCommandSession,announcement),Clock::now()+Milliseconds(config.io_timeout_ms))) throw std::runtime_error("session send failed");
+#endif
                 shared.state.store(ConnectionState::active);
             } catch (const std::exception&) {
-                socket.reset();
+                socket.reset(); shared.commands.close();
                 shared.counters.connect_failures.fetch_add(1);
                 shared.state.store(ConnectionState::backoff);
                 const auto delay = retry.next_delay();
@@ -507,7 +585,7 @@ void network_loop(const Config& config, Shared& shared) {
             const auto send_deadline = Clock::now() + operation_timeout;
             if (!send_bytes(socket, frame, send_deadline)) {
                 shared.counters.send_failures.fetch_add(1);
-                socket.reset();
+                socket.reset(); shared.commands.close();
                 shared.counters.reconnects.fetch_add(1);
                 shared.state.store(ConnectionState::backoff);
                 wait_backoff(retry.next_delay());
@@ -515,11 +593,11 @@ void network_loop(const Config& config, Shared& shared) {
             }
             const auto ack = require_ack(
                 socket, sample, message_sequence,
-                static_cast<std::uint64_t>(operation_timeout.count()));
+                static_cast<std::uint64_t>(operation_timeout.count()), shared, command_authorized);
             if (ack != AckResult::valid) {
                 if (ack == AckResult::invalid) shared.counters.invalid_acks.fetch_add(1);
                 else shared.counters.receive_failures.fetch_add(1);
-                socket.reset();
+                socket.reset(); shared.commands.close();
                 shared.counters.reconnects.fetch_add(1);
                 shared.state.store(ConnectionState::backoff);
                 wait_backoff(retry.next_delay());
@@ -535,7 +613,7 @@ void network_loop(const Config& config, Shared& shared) {
         }
     }
 
-    socket.reset();
+    socket.reset(); shared.commands.close();
     shared.state.store(ConnectionState::stopping);
     std::uint64_t discarded = in_flight ? 1 : 0;
     discarded += shared.retained.discard(std::numeric_limits<std::size_t>::max());
@@ -548,6 +626,7 @@ void print_summary(const Shared& shared) {
     const auto& c = shared.counters;
     const auto retained = shared.retained.snapshot();
     const auto gaps = shared.gaps.snapshot();
+    const auto device = shared.commands.state();
     std::cout << "{\"state\":\"" << state_name(shared.state.load())
               << "\",\"generated\":" << c.generated.load()
               << ",\"acknowledged\":" << c.acknowledged.load()
@@ -565,6 +644,11 @@ void print_summary(const Shared& shared) {
               << ",\"gap_total_dropped\":" << gaps.total_dropped
               << ",\"gap_omitted_dropped\":" << gaps.omitted_dropped
               << ",\"gap_detail_complete\":" << (gaps.detail_complete ? "true" : "false")
+              << ",\"command_effects\":" << device.effects
+              << ",\"device_enabled\":" << (device.enabled ? "true" : "false")
+              << ",\"device_period_ms\":" << device.period_ms
+              << ",\"device_generation\":" << device.generation
+              << ",\"device_fault\":" << (device.fault ? "true" : "false")
               << ",\"gap_ranges\":[";
     for (std::size_t index = 0; index < gaps.detailed_ranges.size(); ++index) {
         if (index != 0) std::cout << ',';

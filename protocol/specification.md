@@ -78,8 +78,9 @@ Total:
 |---:|---|---|
 | 1 | TELEMETRY_SAMPLE | A telemetry measurement from flight to ground |
 | 2 | TELEMETRY_ACK | Ground confirms a telemetry sample was stored |
-| 3 | COMMAND_REQUEST | Ground asks flight to do something |
-| 4 | COMMAND_RESULT | Flight reports command result |
+| 3 | COMMAND_SESSION | Flight announces connection-bound command context |
+| 4 | COMMAND_REQUEST | Ground asks flight to do something |
+| 5 | COMMAND_RESULT | Flight reports applied or rejected command |
 
 M2 implements `TELEMETRY_SAMPLE` and `TELEMETRY_ACK`.
 
@@ -216,3 +217,46 @@ M1 is complete when:
 - C++ and Python agree on the exact bytes
 - malformed messages are rejected
 - split input chunks can be parsed correctly
+
+## M4 command wire contract
+
+All command integers use network byte order. Flight announces exactly one session
+per authenticated TLS connection. Its unpredictable nonzero 64-bit session token
+is invalidated on disconnect and bound to that connection's exact certificate SAN
+role and current boot. The operator role is explicitly configured with
+`--authorized-command-server`; omission denies commands. Observer TLS peers may
+receive telemetry without that role.
+
+| Frame | Payload fields in order | Bytes |
+|---|---|---:|
+| COMMAND_SESSION | session u64, flight_boot_id u64, flight_monotonic_ns u64 | 24 |
+| COMMAND_REQUEST | session u64, sequence u64, command_id u64, deadline_ns u64, opcode u32, argument u32 | 40 |
+| COMMAND_RESULT | session u64, sequence u64, command_id u64, status u32, reserved zero u32 | 32 |
+
+Sequences must be nonzero and strictly greater than the last accepted sequence;
+rejected requests do not advance the accepted sequence. Requests carry an absolute
+flight-monotonic deadline, strictly future and at most five seconds ahead at
+admission. The acquisition owner checks expiry again immediately before applying
+an effect. Header sequence is correlation; the payload sequence enforces replay
+policy. Maximum combined queued work/results is 16, returning queue_full without
+an effect. Network dispatch waits for acquisition completion before transmitting
+an applied result; acceptance itself is never reported as completion.
+
+Opcodes: 1 enable; 2 disable; 3 set-period (argument 1..60000 milliseconds);
+4 reset (increment generation and restart device sequence); 5 clear-fault.
+Other opcodes and nonzero arguments for 1,2,4,5 are invalid. The simulated source
+supports development-only `--fake-fault 1` for observing clear-fault through
+physical-invalid telemetry. The flag is an explicit test configuration.
+
+Statuses: 0 applied; 1 unauthorized; 2 wrong_session; 3 replay; 4 expired;
+5 invalid_argument; 6 queue_full; 7 outcome_unknown. Reserved result bytes must
+be zero. Ground persists received results in SQLite. Lost connection or timed-out
+completion reports outcome_unknown locally, never replays the request, and drops
+an unsent expired operator request. Telemetry ACK retry remains independent.
+
+Local operator access uses `python -m ground.orbit_commands --socket PATH COMMAND`
+with `--argument` for set-period and `--ttl-ms` (1..5000). Start ground with
+`--control-socket PATH`; PATH must be absent within an owner-only directory
+(mode 0700). The socket mode is 0600. Queue and input size are bounded. Existing
+paths are never replaced. A finite flight --count completes acquisition and exits
+after telemetry drain; use a suitably large count for an interactive session.

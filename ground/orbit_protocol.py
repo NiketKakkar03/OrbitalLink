@@ -9,6 +9,9 @@ MAX_PAYLOAD_LENGTH = 4096
 
 TELEMETRY_SAMPLE = 1
 TELEMETRY_ACK = 2
+COMMAND_SESSION = 3
+COMMAND_REQUEST = 4
+COMMAND_RESULT = 5
 TELEMETRY_SAMPLE_PAYLOAD_LENGTH = 44
 TELEMETRY_ACK_PAYLOAD_LENGTH = 20
 
@@ -45,6 +48,19 @@ class TelemetryAck:
     spacecraft_id: int
     flight_boot_id: int
     telemetry_sequence: int
+
+
+@dataclass(frozen=True)
+class ControlMessage:
+    payload: bytes
+
+
+def encode_control(kind: int, payload: bytes, message_sequence: int = 1) -> bytes:
+    expected = {COMMAND_SESSION: 24, COMMAND_REQUEST: 40, COMMAND_RESULT: 32}
+    if kind not in expected or len(payload) != expected[kind]:
+        raise ProtocolError("bad command frame")
+    return HEADER_STRUCT.pack(MAGIC, VERSION, kind, 0, HEADER_LENGTH, 0,
+                              len(payload), message_sequence, 0) + payload
 
 
 def encode_telemetry_sample(sample: TelemetrySample, message_sequence: int = 1) -> bytes:
@@ -116,7 +132,7 @@ def decode_frame(frame: bytes) -> tuple[Header, TelemetrySample | TelemetryAck]:
         raise ProtocolError("bad magic")
     if version != VERSION:
         raise ProtocolError("unsupported version")
-    if message_type not in (TELEMETRY_SAMPLE, TELEMETRY_ACK):
+    if message_type not in (TELEMETRY_SAMPLE, TELEMETRY_ACK, COMMAND_SESSION, COMMAND_REQUEST, COMMAND_RESULT):
         raise ProtocolError("unsupported message type")
     if flags != 0:
         raise ProtocolError("unsupported flags")
@@ -129,6 +145,7 @@ def decode_frame(frame: bytes) -> tuple[Header, TelemetrySample | TelemetryAck]:
     expected_payload_length = {
         TELEMETRY_SAMPLE: TELEMETRY_SAMPLE_PAYLOAD_LENGTH,
         TELEMETRY_ACK: TELEMETRY_ACK_PAYLOAD_LENGTH,
+        COMMAND_SESSION: 24, COMMAND_REQUEST: 40, COMMAND_RESULT: 32,
     }[message_type]
     if payload_length != expected_payload_length:
         if message_type == TELEMETRY_SAMPLE:
@@ -161,13 +178,15 @@ def decode_frame(frame: bytes) -> tuple[Header, TelemetrySample | TelemetryAck]:
             temperature_millideg_c=values[6],
             voltage_millivolts=values[7],
         )
-    else:
+    elif message_type == TELEMETRY_ACK:
         values = TELEMETRY_ACK_STRUCT.unpack(payload)
         message = TelemetryAck(
             spacecraft_id=values[0],
             flight_boot_id=values[1],
             telemetry_sequence=values[2],
         )
+    else:
+        message = ControlMessage(payload)
 
     return header, message
 
@@ -202,7 +221,7 @@ class FrameParser:
                 raise ProtocolError("bad magic")
             if version != VERSION:
                 raise ProtocolError("unsupported version")
-            if message_type not in (TELEMETRY_SAMPLE, TELEMETRY_ACK):
+            if message_type not in (TELEMETRY_SAMPLE, TELEMETRY_ACK, COMMAND_SESSION, COMMAND_REQUEST, COMMAND_RESULT):
                 raise ProtocolError("unsupported message type")
             if flags != 0:
                 raise ProtocolError("unsupported flags")
@@ -215,6 +234,7 @@ class FrameParser:
             expected_payload_length = {
                 TELEMETRY_SAMPLE: TELEMETRY_SAMPLE_PAYLOAD_LENGTH,
                 TELEMETRY_ACK: TELEMETRY_ACK_PAYLOAD_LENGTH,
+                COMMAND_SESSION: 24, COMMAND_REQUEST: 40, COMMAND_RESULT: 32,
             }[message_type]
             if payload_length != expected_payload_length:
                 if message_type == TELEMETRY_SAMPLE:

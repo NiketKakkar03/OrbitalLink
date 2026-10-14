@@ -40,3 +40,50 @@ fails before threads start for missing or invalid files.
 
 References: [OpenSSL hostname verification](https://docs.openssl.org/3.6/man3/SSL_set1_host/)
 and [OpenSSL nonblocking error handling](https://docs.openssl.org/3.6/man3/SSL_get_error/).
+
+## Native commands and operator access
+
+Flight announces a fresh random command session after each authenticated
+connection. Requests bind to that session and an increasing sequence, carry a
+flight-monotonic execution deadline, and pass argument validation before entering
+the bounded acquisition dispatcher. Acquisition checks expiry again before the
+device effect. A reconnect invalidates queued commands. Flight accepts command
+roles only when `--authorized-command-server ground.orbital.test` is explicitly
+configured and the verified server certificate contains that exact DNS SAN.
+Omitting that option permits telemetry but rejects commands.
+
+Start ground with `--control-socket /path/to/private-directory/control.sock`.
+The directory must be owned by the current user with mode 0700; the socket is
+created with mode 0600. Submit one local operator request:
+
+```sh
+.venv/bin/python -m ground.orbit_commands --socket /path/to/private-directory/control.sock reset
+.venv/bin/python -m ground.orbit_commands --socket /path/to/private-directory/control.sock set-period --argument 50
+```
+
+Available operations are `enable`, `disable`, `set-period` (1–60000 milliseconds),
+`reset`, and `clear-fault`. Native operations change the deterministic fake-device
+state; they do not control hardware. Ground stores received completions in SQLite
+`command_results`. `applied` means acquisition performed the operation, while
+rejections have no device effect. A timeout or disconnect yields `outcome_unknown`:
+the effect may have occurred before its result was lost. Neither flight nor ground
+automatically replays an ambiguous request. Operators must inspect current state
+before deliberately submitting another command. Telemetry and SQLite establish
+observable sample state; the flight final summary exposes fake-device state and
+effect counts after shutdown. There is no live device-state query command. If
+current state cannot be established, keep the outcome unknown.
+
+The native threat model protects telemetry and control from unauthenticated
+network peers, spoofed server identities, trusted but unauthorized roles, stale
+sessions, replayed sequences and late or invalid operations. It trusts the host
+OS, local user account, configured CA and private-key storage. A compromised
+operator account or an authorized ground endpoint remains able to command the
+fake device. Development credentials and deterministic emulation provide no
+hardware attestation or production key-management guarantees.
+
+The security tests exercise certificate validity on both peers, foreign-CA
+clients, explicit credential requirements, plaintext rejection and cancellation
+of stalled TLS handshakes. Command tests use real mutual TLS between Python and
+the C++ service, including the protected local operator CLI and SQLite result
+persistence. Embedded driver and QEMU command validation remain later milestone
+gates.

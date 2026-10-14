@@ -22,7 +22,7 @@ def generate(directory: Path) -> None:
         "-addext", "basicConstraints=critical,CA:TRUE",
         "-addext", "keyUsage=critical,keyCertSign,cRLSign")
     for name, purpose in (("ground", "serverAuth"), ("flight", "clientAuth"),
-                          ("unauthorized", "clientAuth")):
+                          ("unauthorized", "clientAuth"), ("observer", "serverAuth")):
         run("req", "-new", "-newkey", "rsa:2048", "-nodes", "-keyout", f"{name}.key",
             "-out", f"{name}.csr", "-subj", f"/CN={name}")
         extensions = directory / f"{name}.ext"
@@ -52,11 +52,12 @@ commonName=supplied
 """)
     for name, start, end in (("expired", "20200101000000Z", "20200102000000Z"),
                              ("future", "20990101000000Z", "20990102000000Z")):
-        run("ca", "-batch", "-config", "signing.cnf", "-in", "flight.csr",
-            "-out", f"{name}.pem", "-startdate", start, "-enddate", end,
-            "-extfile", "flight.ext")
-        (directory / f"{name}.key").write_bytes((directory / "flight.key").read_bytes())
-        os.chmod(directory / f"{name}.key", 0o600)
+        for identity, output in (("flight", name), ("ground", "ground-" + name)):
+            run("ca", "-batch", "-config", "signing.cnf", "-in", f"{identity}.csr",
+                "-out", f"{output}.pem", "-startdate", start, "-enddate", end,
+                "-extfile", f"{identity}.ext")
+            (directory / f"{output}.key").write_bytes((directory / f"{identity}.key").read_bytes())
+            os.chmod(directory / f"{output}.key", 0o600)
 
 
 if __name__ == "__main__":

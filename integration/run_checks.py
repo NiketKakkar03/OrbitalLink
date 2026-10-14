@@ -22,6 +22,7 @@ SUITES = {
     "sanitizers": ["make", "test-sanitizers"],
     "tsan": ["make", "test-tsan"],
     "security": ["make", "test-security"],
+    "security-sanitizers": ["make", "test-security-sanitizers"],
 }
 
 
@@ -62,8 +63,15 @@ def run_command(
             start_new_session=True,
         )
     except OSError as error:
-        log_path.write_text(f"Could not start check: {error}\n")
-        return {**result, "error": str(error), "duration_seconds": time.monotonic() - started}
+        diagnostic = f"Could not start check: {error}\n".encode()
+        retained = diagnostic[:max_log_bytes]
+        log_path.write_bytes(retained)
+        return {
+            **result, "error": str(error), "returncode": None,
+            "duration_seconds": round(time.monotonic() - started, 3),
+            "output_bytes": len(diagnostic), "retained_bytes": len(retained),
+            "log_truncated": len(diagnostic) > len(retained), "log_errors": [],
+        }
 
     assert process.stdout is not None
     output_bytes = 0

@@ -8,6 +8,9 @@ import signal
 import socket
 import ssl
 import threading
+import struct
+import time
+from ground.orbit_commands import CommandBroker, ControlSocket
 from dataclasses import asdict
 from pathlib import Path
 from typing import Protocol
@@ -16,6 +19,7 @@ from ground.orbit_protocol import (
     FrameParser,
     ProtocolError,
     TELEMETRY_SAMPLE,
+    COMMAND_SESSION, COMMAND_RESULT, ControlMessage,
     TelemetryAck,
     TelemetrySample,
     encode_telemetry_ack,
@@ -46,19 +50,38 @@ def classify_physical_validity(sample: TelemetrySample) -> tuple[bool, str | Non
 class GroundReceiver:
     """Receive telemetry, commit it, then acknowledge its durable identity."""
 
-    def __init__(self, storage: SampleStorage):
+    def __init__(self, storage: SampleStorage, broker=None, stop_event=None):
         self._storage = storage
         self.receipts = 0
+        self.broker = broker
+        self.stop_event = stop_event
 
     def handle_connection(self, connection: socket.socket) -> None:
         parser = FrameParser()
-        while True:
-            chunk = connection.recv(64 * 1024)
+        while not self.stop_event or not self.stop_event.is_set():
+            if self.broker:
+                # One in-flight operator request keeps dispatch bounded.
+                frame=self.broker.next_frame()
+                if frame: connection.sendall(frame)
+            try:
+                chunk = connection.recv(64 * 1024)
+            except TimeoutError:
+                continue
             if not chunk:
                 parser.finish()
                 return
 
             for header, message in parser.feed(chunk):
+                if header.message_type == COMMAND_SESSION and isinstance(message, ControlMessage):
+                    if self.broker: self.broker.open(*struct.unpack('!QQQ',message.payload))
+                    continue
+                if header.message_type == COMMAND_RESULT and isinstance(message, ControlMessage):
+                    if self.broker: self.broker.result(message.payload)
+                    if hasattr(self._storage,'record_command_result'):
+                        session,sequence,identifier,status,_=struct.unpack('!QQQII',message.payload)
+                        from ground.orbit_commands import STATUS_NAMES
+                        self._storage.record_command_result(command_id=identifier,command_session_id=session,command_sequence=sequence,status=STATUS_NAMES[status])
+                    continue
                 if header.message_type != TELEMETRY_SAMPLE or not isinstance(message, TelemetrySample):
                     raise ProtocolError("ground receiver expected telemetry sample")
 
@@ -90,6 +113,8 @@ def serve(
     tls_context: ssl.SSLContext | None = None,
     allowed_client: str | None = None,
     test_plaintext: bool = False,
+    control_socket: Path | None = None,
+    command_broker: CommandBroker | None = None,
 ) -> int:
     """Serve connections until stopped; return the number of acknowledged receipts."""
     own_stop_event = stop_event or threading.Event()
@@ -100,7 +125,9 @@ def serve(
     if tls_context is not None and not allowed_client:
         raise ValueError("explicit client SAN allowlist identity required")
     storage = TelemetryStorage(database_path)
-    receiver = GroundReceiver(storage)
+    broker = command_broker or CommandBroker()
+    receiver = GroundReceiver(storage, broker, own_stop_event)
+    control = ControlSocket(control_socket,broker,own_stop_event) if control_socket else None
 
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
@@ -124,19 +151,33 @@ def serve(
                     connection.settimeout(10)
                     try:
                         if tls_context is not None:
-                            connection = tls_context.wrap_socket(connection, server_side=True)
+                            connection = tls_context.wrap_socket(connection, server_side=True, do_handshake_on_connect=False)
+                            connection.settimeout(.2)
+                            handshake_deadline=time.monotonic()+2
+                            while not own_stop_event.is_set():
+                                try:
+                                    connection.do_handshake()
+                                    break
+                                except TimeoutError:
+                                    if time.monotonic() >= handshake_deadline: raise
+                            if own_stop_event.is_set(): continue
                             names = [value for kind, value in connection.getpeercert().get("subjectAltName", ()) if kind == "DNS"]
                             if allowed_client not in names:
                                 connection.close()
                                 continue
+                        connection.settimeout(.2)
                         receiver.handle_connection(connection)
-                    except (ProtocolError, OSError):
+                    except (ProtocolError, OSError, ValueError):
                         # A malformed or interrupted peer is isolated to its
                         # connection. It never reaches storage or receives ACK.
                         continue
                     finally:
+                        broker.close()
                         connection.close()
     finally:
+        own_stop_event.set()
+        broker.close()
+        if control: control.close()
         storage.close()
 
     return receiver.receipts
@@ -144,6 +185,7 @@ def serve(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="OrbitalLink authenticated ground receiver")
+    parser.add_argument("--control-socket",type=Path)
     parser.add_argument("--ca", type=Path)
     parser.add_argument("--cert", type=Path)
     parser.add_argument("--key", type=Path)
@@ -210,6 +252,7 @@ def main() -> int:
         tls_context=context,
         allowed_client=arguments.allowed_client,
         test_plaintext=arguments.test_plaintext,
+        control_socket=arguments.control_socket,
     )
     return 0
 

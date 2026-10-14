@@ -14,6 +14,9 @@ constexpr const char* kGoldenFrameHex =
     "4f4c4e4b01010000001c00000000002c00000000000000010000000000000001"
     "0102030405060708000000000000002a000000070000006300000000499602d2"
     "ffffeb7e00000ce4";
+constexpr const char* kGoldenAckHex =
+    "4f4c4e4b01020000001c000000000014000000000000000200000000"
+    "000000010102030405060708000000000000002a";
 
 std::uint8_t hex_value(char ch) {
     if (ch >= '0' && ch <= '9') {
@@ -198,6 +201,58 @@ void test_parser_rejects_invalid_header_before_waiting_for_payload() {
     }
 }
 
+void test_parser_rejects_eof_during_frame() {
+    auto frame = from_hex(kGoldenFrameHex);
+    frame.pop_back();
+    orbit::FrameParser parser;
+    assert(parser.feed(frame).empty());
+    try {
+        parser.finish();
+        assert(false && "expected ProtocolError");
+    } catch (const orbit::ProtocolError& error) {
+        assert(std::string(error.what()) == "truncated frame at end of stream");
+    }
+}
+
+void test_parser_accepts_clean_eof() {
+    orbit::FrameParser parser;
+    assert(parser.feed(from_hex(kGoldenFrameHex)).size() == 1);
+    parser.finish();
+}
+
+void test_encode_and_decode_telemetry_ack() {
+    const orbit::TelemetryAck ack{1, 0x0102030405060708ULL, 42};
+    const auto frame = orbit::encode_telemetry_ack(ack, 2);
+    assert(to_hex(frame) == kGoldenAckHex);
+
+    const auto decoded = orbit::decode_frame(frame);
+    assert(decoded.header.message_type == orbit::kTelemetryAck);
+    assert(decoded.header.payload_length == 20);
+    assert(decoded.header.message_sequence == 2);
+    assert(decoded.ack.spacecraft_id == 1);
+    assert(decoded.ack.flight_boot_id == 0x0102030405060708ULL);
+    assert(decoded.ack.telemetry_sequence == 42);
+}
+
+void test_parser_accepts_sample_followed_by_ack() {
+    auto frames = from_hex(kGoldenFrameHex);
+    const auto ack = from_hex(kGoldenAckHex);
+    frames.insert(frames.end(), ack.begin(), ack.end());
+
+    orbit::FrameParser parser;
+    const auto decoded = parser.feed(frames);
+    assert(decoded.size() == 2);
+    assert(decoded[0].header.message_type == orbit::kTelemetrySample);
+    assert(decoded[1].header.message_type == orbit::kTelemetryAck);
+    assert(decoded[1].ack.telemetry_sequence == 42);
+}
+
+void test_rejects_bad_ack_payload_length() {
+    auto frame = from_hex(kGoldenAckHex);
+    frame[15] = 19;
+    assert_protocol_error(frame, "bad telemetry ACK payload length");
+}
+
 }  // namespace
 
 int main() {
@@ -216,6 +271,11 @@ int main() {
     test_parser_accepts_split_chunks();
     test_parser_accepts_multiple_frames();
     test_parser_rejects_invalid_header_before_waiting_for_payload();
+    test_parser_rejects_eof_during_frame();
+    test_parser_accepts_clean_eof();
+    test_encode_and_decode_telemetry_ack();
+    test_parser_accepts_sample_followed_by_ack();
+    test_rejects_bad_ack_payload_length();
 
     std::cout << "C++ protocol tests passed\n";
     return 0;

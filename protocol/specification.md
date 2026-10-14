@@ -1,6 +1,6 @@
 # OrbitalLink Protocol Specification
 
-Status: draft for M1
+Status: implemented through M2
 Version: 1
 
 ## 1. Purpose
@@ -81,7 +81,7 @@ Total:
 | 3 | COMMAND_REQUEST | Ground asks flight to do something |
 | 4 | COMMAND_RESULT | Flight reports command result |
 
-M1 only implements `TELEMETRY_SAMPLE`.
+M2 implements `TELEMETRY_SAMPLE` and `TELEMETRY_ACK`.
 
 ## 6. TELEMETRY_SAMPLE Payload
 
@@ -104,7 +104,28 @@ Total:
 4 + 8 + 8 + 4 + 4 + 8 + 4 + 4 = 44 bytes
 ```
 
-## 7. Temperature Units
+## 7. TELEMETRY_ACK Payload
+
+The telemetry acknowledgement payload is exactly 20 bytes.
+
+| Offset | Size | Field | Type | Meaning |
+|---:|---:|---|---|---|
+| 0 | 4 | spacecraft_id | unsigned 32-bit | Identifies the spacecraft whose sample was stored |
+| 4 | 8 | flight_boot_id | unsigned 64-bit | Identifies the flight-service run that produced the sample |
+| 12 | 8 | telemetry_sequence | unsigned 64-bit | Identifies the stored sample within that run |
+
+These three fields are the durable identity of a telemetry sample. An ACK is sent only after the
+sample's database transaction commits. The same ACK may be sent for a duplicate sample that is
+already stored. A flight sender must match all three fields before treating its sample as stored;
+the header `message_sequence` alone is not a durable sample identifier.
+
+Total:
+
+```text
+4 + 8 + 8 = 20 bytes
+```
+
+## 8. Temperature Units
 
 Temperature is stored as milli-degrees Celsius.
 
@@ -117,7 +138,7 @@ That means:
 
 We use integers instead of decimal numbers because integers are easier to encode exactly.
 
-## 8. Voltage Units
+## 9. Voltage Units
 
 Voltage is stored as millivolts.
 
@@ -127,7 +148,7 @@ That means:
 3.300 V = 3300 millivolts
 ```
 
-## 9. Golden Telemetry Sample
+## 10. Golden Telemetry Sample
 
 This is the first sample both C++ and Python must understand.
 
@@ -154,7 +175,24 @@ The header values for this sample are:
 | payload_length | 44 |
 | message_sequence | 1 |
 
-## 10. Rejection Rules
+## 11. Golden Telemetry ACK
+
+The golden ACK confirms storage of the golden sample above.
+
+| Field | Value |
+|---|---:|
+| spacecraft_id | 1 |
+| flight_boot_id | 0x0102030405060708 |
+| telemetry_sequence | 42 |
+| header message_sequence | 2 |
+
+Its complete encoded frame in hexadecimal is:
+
+```text
+4f4c4e4b01020000001c000000000014000000000000000200000000000000010102030405060708000000000000002a
+```
+
+## 12. Rejection Rules
 
 A receiver must reject the message if:
 
@@ -169,7 +207,7 @@ A receiver must reject the message if:
 - the input ends before the full header arrives
 - the input ends before the full payload arrives
 
-## 11. M1 Completion Goal
+## 13. M1 Completion Goal
 
 M1 is complete when:
 

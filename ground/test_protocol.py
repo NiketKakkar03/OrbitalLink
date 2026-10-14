@@ -6,17 +6,24 @@ import pytest
 from ground.orbit_protocol import (
     FrameParser,
     ProtocolError,
+    TelemetryAck,
     TelemetrySample,
     decode_frame,
+    encode_telemetry_ack,
     encode_telemetry_sample,
 )
 
 
 FIXTURE_PATH = Path(__file__).resolve().parents[1] / "protocol" / "fixtures" / "telemetry_sample_v1.json"
+ACK_FIXTURE_PATH = Path(__file__).resolve().parents[1] / "protocol" / "fixtures" / "telemetry_ack_v1.json"
 
 
 def load_fixture():
     return json.loads(FIXTURE_PATH.read_text())
+
+
+def load_ack_fixture():
+    return json.loads(ACK_FIXTURE_PATH.read_text())
 
 
 def test_decode_golden_telemetry_sample():
@@ -176,3 +183,58 @@ def test_parser_rejects_invalid_header_before_waiting_for_payload():
 
     with pytest.raises(ProtocolError, match="bad magic"):
         parser.feed(bytes(frame[:28]))
+
+
+def test_parser_rejects_eof_during_frame():
+    frame = bytes.fromhex(load_fixture()["frame_hex"])
+    parser = FrameParser()
+
+    assert parser.feed(frame[:-1]) == []
+    with pytest.raises(ProtocolError, match="truncated frame at end of stream"):
+        parser.finish()
+
+
+def test_parser_accepts_clean_eof():
+    parser = FrameParser()
+    parser.feed(bytes.fromhex(load_fixture()["frame_hex"]))
+
+    parser.finish()
+
+
+def test_encode_and_decode_telemetry_ack():
+    fixture = load_ack_fixture()
+    ack = TelemetryAck(
+        spacecraft_id=fixture["ack"]["spacecraft_id"],
+        flight_boot_id=int(fixture["ack"]["flight_boot_id_hex"], 16),
+        telemetry_sequence=fixture["ack"]["telemetry_sequence"],
+    )
+
+    frame = encode_telemetry_ack(ack, message_sequence=2)
+    header, decoded = decode_frame(frame)
+
+    assert frame.hex() == fixture["frame_hex"]
+    assert header.message_type == 2
+    assert header.payload_length == 20
+    assert header.message_sequence == 2
+    assert decoded == ack
+
+
+def test_parser_accepts_sample_followed_by_ack():
+    sample_frame = bytes.fromhex(load_fixture()["frame_hex"])
+    ack = TelemetryAck(1, int("0102030405060708", 16), 42)
+    ack_frame = encode_telemetry_ack(ack, message_sequence=2)
+    parser = FrameParser()
+
+    decoded = parser.feed(sample_frame + ack_frame)
+
+    assert len(decoded) == 2
+    assert isinstance(decoded[0][1], TelemetrySample)
+    assert decoded[1][1] == ack
+
+
+def test_rejects_bad_ack_payload_length():
+    frame = bytearray(encode_telemetry_ack(TelemetryAck(1, 2, 3)))
+    frame[15] = 19
+
+    with pytest.raises(ProtocolError, match="bad telemetry ACK payload length"):
+        decode_frame(bytes(frame))

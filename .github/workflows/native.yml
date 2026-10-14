@@ -1,0 +1,18 @@
+name: Native validation
+on: [push, pull_request]
+jobs:
+  native:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r requirements.txt
+      - run: make check PYTHON=python
+      - run: make test-sanitizers
+      - if: runner.os == 'macOS'
+        run: make test-tsan

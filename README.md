@@ -85,6 +85,11 @@ capacity is 1,024 samples. When the backlog is full, the oldest queued sample is
 dropped so recent telemetry is retained. The one partially or fully transmitted
 but unacknowledged frame is bounded separately and is never evicted midway.
 
+Each service run generates a fresh random 64-bit boot identity so restarted
+sequence numbers remain distinct in SQLite. Use `--boot-id NUMBER` for explicit
+replay experiments. The small `send_sample` fixture tool deliberately retains a
+fixed identity for deterministic duplicate tests.
+
 The service prints one final JSON object containing counters such as:
 
 ```text

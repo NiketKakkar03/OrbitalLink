@@ -1,0 +1,26 @@
+# Native development environment
+
+The native M0–M3 path supports macOS and Linux. Install Git, Make, a C++20
+compiler with pthread support (Apple Clang or GCC), and Python 3.11 or newer.
+The ground station uses Python's standard-library SQLite implementation.
+
+From the repository root:
+
+```sh
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+make check
+make test-sanitizers
+make test-tsan
+```
+
+Integration tests bind ephemeral loopback TCP ports and launch local child
+processes. A restricted execution sandbox must permit those operations.
+`make` selects `.venv/bin/python` when present; override `PYTHON` or `CXX` for
+another interpreter or compiler. Sanitizer targets require the corresponding
+compiler runtime; their availability depends on the platform/toolchain.
+
+The verified local baseline uses Apple Clang on arm64 macOS and Python 3.14.6.
+CI checks the native suite on Ubuntu and macOS. These native checks do not
+require QEMU, a Linux guest, a kernel build, or a cross-compiler; those belong
+to later embedded milestones. See the README for a two-terminal telemetry demo.

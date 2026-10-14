@@ -203,6 +203,23 @@ def assert_final_accounting(counters: dict[str, int | str]) -> None:
     assert counters["retained"] == 0
 
 
+def test_restarted_service_uses_distinct_boot_identity(
+    tmp_path: Path, flight_service: Path
+):
+    database = tmp_path / "restart.db"
+    with FaultGround(database, expected_unique=8) as ground:
+        for _ in range(2):
+            counters = run_service(flight_service, ground.port, count=4)
+            assert counters["acknowledged"] == 4
+    storage = TelemetryStorage(database)
+    try:
+        samples = storage.load_samples()
+        assert len(samples) == 8
+        assert len({sample.flight_boot_id for sample in samples}) == 2
+    finally:
+        storage.close()
+
+
 @pytest.mark.parametrize("fault", ["drop", "partial"])
 def test_reconnects_after_lost_or_partial_ack_without_database_duplicates(
     tmp_path: Path, flight_service: Path, fault: str

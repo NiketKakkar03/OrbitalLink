@@ -53,7 +53,11 @@ struct Config {
     std::uint64_t io_timeout_ms{500};
     std::uint64_t drain_ms{3000};
     std::size_t max_frames_per_iteration{16};
-    std::uint64_t boot_id{0x0102030405060708ULL};
+    std::uint64_t boot_id{[] {
+        std::random_device entropy;
+        std::uniform_int_distribution<std::uint64_t> distribution;
+        return distribution(entropy);
+    }()};
     int ready_fd{-1};
 };
 

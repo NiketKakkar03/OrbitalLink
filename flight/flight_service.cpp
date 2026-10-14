@@ -18,11 +18,17 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <random>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
+#ifndef ORBIT_TEST_PLAINTEXT
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+#include <openssl/x509v3.h>
+#endif
 
 namespace {
 
@@ -44,6 +50,7 @@ const char* state_name(ConnectionState state) {
 }
 
 struct Config {
+    std::string ca, certificate, key, server_name;
     std::string host;
     std::uint16_t port{};
     std::uint64_t count{100};
@@ -98,23 +105,34 @@ extern "C" void request_stop(int) {
 
 class Socket {
   public:
+#ifndef ORBIT_TEST_PLAINTEXT
+    SSL* tls{};
+#endif
     Socket() = default;
     explicit Socket(int fd) : fd_(fd) {}
     ~Socket() { reset(); }
     Socket(const Socket&) = delete;
     Socket& operator=(const Socket&) = delete;
-    Socket(Socket&& other) noexcept : fd_(other.fd_) { other.fd_ = -1; }
+    Socket(Socket&& other) noexcept { *this = std::move(other); }
     Socket& operator=(Socket&& other) noexcept {
         if (this != &other) {
             reset();
             fd_ = other.fd_;
             other.fd_ = -1;
+#ifndef ORBIT_TEST_PLAINTEXT
+            tls = other.tls;
+            other.tls = nullptr;
+#endif
         }
         return *this;
     }
     int get() const { return fd_; }
     explicit operator bool() const { return fd_ >= 0; }
     void reset() {
+#ifndef ORBIT_TEST_PLAINTEXT
+        if (tls) SSL_free(tls);
+        tls = nullptr;
+#endif
         if (fd_ >= 0) ::close(fd_);
         fd_ = -1;
     }
@@ -142,6 +160,10 @@ Config parse_args(int argc, char** argv) {
     for (int i = 3; i < argc; i += 2) {
         if (i + 1 >= argc) throw std::invalid_argument(std::string("missing value for ") + argv[i]);
         const std::string option = argv[i];
+        if (option == "--ca") { config.ca = argv[i + 1]; continue; }
+        if (option == "--cert") { config.certificate = argv[i + 1]; continue; }
+        if (option == "--key") { config.key = argv[i + 1]; continue; }
+        if (option == "--server-name") { config.server_name = argv[i + 1]; continue; }
         const auto value = parse_u64(argv[i + 1], option.c_str());
         if (option == "--count") config.count = value;
         else if (option == "--interval-ms") config.interval_ms = value;
@@ -165,6 +187,16 @@ Config parse_args(int argc, char** argv) {
     if (config.connect_timeout_ms == 0 || config.io_timeout_ms == 0)
         throw std::invalid_argument("network timeouts must be positive");
     config.drain_ms = std::min<std::uint64_t>(config.drain_ms, 3000);
+#ifndef ORBIT_TEST_PLAINTEXT
+    if (config.ca.empty() || config.certificate.empty() || config.key.empty() || config.server_name.empty())
+        throw std::invalid_argument("TLS requires --ca --cert --key --server-name");
+    const auto validation = std::unique_ptr<SSL_CTX, decltype(&SSL_CTX_free)>(SSL_CTX_new(TLS_client_method()), SSL_CTX_free);
+    if (!validation || SSL_CTX_load_verify_locations(validation.get(), config.ca.c_str(), nullptr) != 1 ||
+        SSL_CTX_use_certificate_chain_file(validation.get(), config.certificate.c_str()) != 1 ||
+        SSL_CTX_use_PrivateKey_file(validation.get(), config.key.c_str(), SSL_FILETYPE_PEM) != 1 ||
+        SSL_CTX_check_private_key(validation.get()) != 1)
+        throw std::invalid_argument("invalid TLS credentials");
+#endif
     return config;
 }
 
@@ -250,10 +282,21 @@ Socket connect_with_deadline(const Config& config) {
     return socket;
 }
 
-bool send_bytes(int fd, const std::vector<std::uint8_t>& bytes, Clock::time_point deadline) {
+bool send_bytes(Socket& socket, const std::vector<std::uint8_t>& bytes, Clock::time_point deadline) {
+    const int fd = socket.get();
     std::size_t offset = 0;
     while (offset < bytes.size()) {
-#ifdef MSG_NOSIGNAL
+#ifndef ORBIT_TEST_PLAINTEXT
+        ERR_clear_error();
+        const auto sent = SSL_write(socket.tls, bytes.data() + offset, static_cast<int>(bytes.size() - offset));
+        if (sent <= 0) {
+            const auto error = SSL_get_error(socket.tls, sent);
+            if (error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE) {
+                if (wait_fd(fd, error == SSL_ERROR_WANT_READ ? POLLIN : POLLOUT, deadline) == 1) continue;
+            }
+            return false;
+        }
+#elif defined(MSG_NOSIGNAL)
         const auto sent = ::send(fd, bytes.data() + offset, bytes.size() - offset, MSG_NOSIGNAL);
 #else
         const auto sent = ::send(fd, bytes.data() + offset, bytes.size() - offset, 0);
@@ -271,12 +314,25 @@ bool send_bytes(int fd, const std::vector<std::uint8_t>& bytes, Clock::time_poin
     return true;
 }
 
-bool receive_bytes(int fd, std::vector<std::uint8_t>& bytes, std::size_t size,
+bool receive_bytes(Socket& socket, std::vector<std::uint8_t>& bytes, std::size_t size,
                    Clock::time_point deadline) {
+    const int fd = socket.get();
     bytes.resize(size);
     std::size_t offset = 0;
     while (offset < size) {
+#ifndef ORBIT_TEST_PLAINTEXT
+        ERR_clear_error();
+        const auto received = SSL_read(socket.tls, bytes.data() + offset, static_cast<int>(size - offset));
+        if (received <= 0) {
+            const auto error = SSL_get_error(socket.tls, received);
+            if (error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE) {
+                if (wait_fd(fd, error == SSL_ERROR_WANT_READ ? POLLIN : POLLOUT, deadline) == 1) continue;
+            }
+            return false;
+        }
+#else
         const auto received = ::recv(fd, bytes.data() + offset, size - offset, 0);
+#endif
         if (received > 0) {
             offset += static_cast<std::size_t>(received);
             continue;
@@ -292,15 +348,15 @@ bool receive_bytes(int fd, std::vector<std::uint8_t>& bytes, std::size_t size,
 
 enum class AckResult { valid, receive_failure, invalid };
 
-AckResult require_ack(int fd, const orbit::TelemetrySample& sample, std::uint64_t message_sequence,
+AckResult require_ack(Socket& socket, const orbit::TelemetrySample& sample, std::uint64_t message_sequence,
                       std::uint64_t timeout_ms) {
     const auto deadline = Clock::now() + Milliseconds(timeout_ms);
     std::vector<std::uint8_t> header;
-    if (!receive_bytes(fd, header, orbit::kHeaderLength, deadline)) return AckResult::receive_failure;
+    if (!receive_bytes(socket, header, orbit::kHeaderLength, deadline)) return AckResult::receive_failure;
     const auto payload_length = orbit::read_u32(header, 12);
     if (payload_length > orbit::kMaxPayloadLength) return AckResult::invalid;
     std::vector<std::uint8_t> payload;
-    if (!receive_bytes(fd, payload, payload_length, deadline)) return AckResult::receive_failure;
+    if (!receive_bytes(socket, payload, payload_length, deadline)) return AckResult::receive_failure;
     header.insert(header.end(), payload.begin(), payload.end());
     try {
         const auto decoded = orbit::decode_frame(header);
@@ -318,6 +374,19 @@ AckResult require_ack(int fd, const orbit::TelemetrySample& sample, std::uint64_
 }
 
 void network_loop(const Config& config, Shared& shared) {
+#ifndef ORBIT_TEST_PLAINTEXT
+    const auto context = std::unique_ptr<SSL_CTX, decltype(&SSL_CTX_free)>(SSL_CTX_new(TLS_client_method()), SSL_CTX_free);
+    if (!context || SSL_CTX_set_min_proto_version(context.get(), TLS1_3_VERSION) != 1 ||
+        SSL_CTX_load_verify_locations(context.get(), config.ca.c_str(), nullptr) != 1 ||
+        SSL_CTX_use_certificate_chain_file(context.get(), config.certificate.c_str()) != 1 ||
+        SSL_CTX_use_PrivateKey_file(context.get(), config.key.c_str(), SSL_FILETYPE_PEM) != 1 ||
+        SSL_CTX_check_private_key(context.get()) != 1) {
+        // Configuration failures are fatal rather than silently downgrading transport.
+        shared.stop_requested.store(true);
+        return;
+    }
+    SSL_CTX_set_verify(context.get(), SSL_VERIFY_PEER, nullptr);
+#endif
     Socket socket;
     std::uint64_t message_sequence = 1;
     std::uint64_t attempts_for_front = 0;
@@ -385,9 +454,27 @@ void network_loop(const Config& config, Shared& shared) {
                 }
                 socket = connect_with_deadline(connect_config);
                 shared.state.store(ConnectionState::authenticating);
-                // M3 is plaintext; this explicit state is the seam used by M4 TLS.
+#ifndef ORBIT_TEST_PLAINTEXT
+                socket.tls = SSL_new(context.get());
+                if (!socket.tls || SSL_set_fd(socket.tls, socket.get()) != 1 ||
+                    SSL_set1_host(socket.tls, config.server_name.c_str()) != 1 ||
+                    SSL_set_tlsext_host_name(socket.tls, config.server_name.c_str()) != 1)
+                    throw std::runtime_error("TLS setup failed");
+                SSL_set_hostflags(socket.tls, X509_CHECK_FLAG_NEVER_CHECK_SUBJECT);
+                const auto deadline = Clock::now() + Milliseconds(connect_config.connect_timeout_ms);
+                while (true) {
+                    ERR_clear_error();
+                    const int result = SSL_connect(socket.tls);
+                    if (result == 1) break;
+                    const int error = SSL_get_error(socket.tls, result);
+                    if ((error != SSL_ERROR_WANT_READ && error != SSL_ERROR_WANT_WRITE) ||
+                        wait_fd(socket.get(), error == SSL_ERROR_WANT_READ ? POLLIN : POLLOUT, deadline) != 1)
+                        throw std::runtime_error("TLS authentication failed");
+                }
+#endif
                 shared.state.store(ConnectionState::active);
             } catch (const std::exception&) {
+                socket.reset();
                 shared.counters.connect_failures.fetch_add(1);
                 shared.state.store(ConnectionState::backoff);
                 const auto delay = retry.next_delay();
@@ -418,7 +505,7 @@ void network_loop(const Config& config, Shared& shared) {
                              std::chrono::duration_cast<Milliseconds>(drain_deadline - Clock::now())));
             }
             const auto send_deadline = Clock::now() + operation_timeout;
-            if (!send_bytes(socket.get(), frame, send_deadline)) {
+            if (!send_bytes(socket, frame, send_deadline)) {
                 shared.counters.send_failures.fetch_add(1);
                 socket.reset();
                 shared.counters.reconnects.fetch_add(1);
@@ -427,7 +514,7 @@ void network_loop(const Config& config, Shared& shared) {
                 break;
             }
             const auto ack = require_ack(
-                socket.get(), sample, message_sequence,
+                socket, sample, message_sequence,
                 static_cast<std::uint64_t>(operation_timeout.count()));
             if (ack != AckResult::valid) {
                 if (ack == AckResult::invalid) shared.counters.invalid_acks.fetch_add(1);
@@ -493,6 +580,7 @@ int main(int argc, char** argv) {
     early_stop_requested.store(false);
     ::signal(SIGINT, request_stop);
     ::signal(SIGTERM, request_stop);
+    ::signal(SIGPIPE, SIG_IGN);
     try {
         const auto config = parse_args(argc, argv);
         Shared shared(config.capacity);

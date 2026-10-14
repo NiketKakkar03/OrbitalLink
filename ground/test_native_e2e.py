@@ -65,6 +65,7 @@ def start_ground(tmp_path: Path, *, max_receipts: int | None = None):
         sys.executable,
         "-m",
         "ground.orbit_ground",
+        "--test-plaintext",
         "--database",
         str(database),
         "--ready-file",

@@ -34,6 +34,7 @@ def flight_service(tmp_path_factory: pytest.TempPathFactory) -> Path:
             "c++",
             "-std=c++20",
             "-pthread",
+            "-DORBIT_TEST_PLAINTEXT",
             "-Wall",
             "-Wextra",
             "-Werror",

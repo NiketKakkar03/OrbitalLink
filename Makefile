@@ -1,10 +1,16 @@
 CXX ?= c++
 CXXFLAGS ?= -std=c++20 -Wall -Wextra -Werror
+OPENSSL_PREFIX ?= $(shell if [ -d /opt/homebrew/opt/openssl@3 ]; then printf /opt/homebrew/opt/openssl@3; elif [ -d /usr/local/opt/openssl@3 ]; then printf /usr/local/opt/openssl@3; fi)
+TLS_CXXFLAGS = $(if $(OPENSSL_PREFIX),-I$(OPENSSL_PREFIX)/include)
+TLS_LDLIBS = $(if $(OPENSSL_PREFIX),-L$(OPENSSL_PREFIX)/lib) -lssl -lcrypto
 PYTHON ?= $(shell if [ -x .venv/bin/python ]; then printf '.venv/bin/python'; else printf 'python3'; fi)
 
-.PHONY: check test-python test-cpp test-native-e2e test-recovery test-sanitizers test-tsan clean
+.PHONY: check test-python test-cpp test-native-e2e test-recovery test-security test-sanitizers test-tsan clean
 
-check: test-python test-cpp test-native-e2e test-recovery
+check: test-python test-cpp test-native-e2e test-recovery test-security
+
+test-security:
+	$(PYTHON) -m pytest ground/test_security_e2e.py
 
 test-python:
 	$(PYTHON) -m json.tool protocol/fixtures/telemetry_sample_v1.json >/dev/null
@@ -25,14 +31,14 @@ test-cpp:
 	$(CXX) $(CXXFLAGS) -pthread flight/tests/test_m3_policy.cpp -o /tmp/orbit_m3_policy_test
 	/tmp/orbit_m3_policy_test
 	$(CXX) $(CXXFLAGS) flight/send_sample.cpp -o /tmp/orbit_send_sample
-	$(CXX) $(CXXFLAGS) -pthread flight/flight_service.cpp -o /tmp/orbit_flight_service
+	$(CXX) $(CXXFLAGS) $(TLS_CXXFLAGS) -pthread flight/flight_service.cpp -o /tmp/orbit_flight_service $(TLS_LDLIBS)
 
 test-sanitizers:
 	$(CXX) $(CXXFLAGS) -pthread -fsanitize=address,undefined \
 		flight/tests/test_m3_policy.cpp -o /tmp/orbit_m3_policy_sanitized
 	/tmp/orbit_m3_policy_sanitized
 	$(CXX) $(CXXFLAGS) -pthread -fsanitize=address,undefined \
-		flight/flight_service.cpp -o /tmp/orbit_flight_service_sanitized
+		-DORBIT_TEST_PLAINTEXT flight/flight_service.cpp -o /tmp/orbit_flight_service_sanitized
 	/tmp/orbit_flight_service_sanitized 127.0.0.1 1 --count 10000 \
 		--interval-ms 0 --capacity 32 --connect-timeout-ms 10 --io-timeout-ms 10 --drain-ms 25
 
@@ -41,7 +47,7 @@ test-tsan:
 		flight/tests/test_m3_policy.cpp -o /tmp/orbit_m3_policy_tsan
 	/tmp/orbit_m3_policy_tsan
 	$(CXX) $(CXXFLAGS) -pthread -fsanitize=thread \
-		flight/flight_service.cpp -o /tmp/orbit_flight_service_tsan
+		-DORBIT_TEST_PLAINTEXT flight/flight_service.cpp -o /tmp/orbit_flight_service_tsan
 	/tmp/orbit_flight_service_tsan 127.0.0.1 1 --count 10000 \
 		--interval-ms 0 --capacity 32 --connect-timeout-ms 10 --io-timeout-ms 10 --drain-ms 25
 

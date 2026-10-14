@@ -8,9 +8,10 @@ C++ acquisition thread -> bounded retention queue -> C++ network thread
     -> TCP -> Python ground station -> SQLite commit -> ACK
 ```
 
-The native transport is intentionally plaintext and bound to loopback by default. It
-is a development stage, not the release security design; mutual TLS arrives in
-M4.
+The normal flight service and ground receiver use mutual TLS 1.3 with explicit
+peer identity authorization. See [security setup](docs/security.md) for the
+authenticated demo. The deterministic sender below uses the explicit loopback
+fixture transport retained for M2/M3 regression tests.
 
 ## Verify M0 through M3
 
@@ -40,6 +41,7 @@ In one terminal, start the ground receiver:
 
 ```bash
 .venv/bin/python -m ground.orbit_ground \
+  --test-plaintext \
   --database /tmp/orbit-telemetry.db \
   --port 9000
 ```
@@ -68,13 +70,16 @@ stored with a validity flag and reason; malformed protocol frames are rejected.
 
 ## Run the M3 flight service
 
-With the same ground receiver running on port 9000, compile and start the
-concurrent service:
+With the TLS receiver and disposable certificates described in
+`docs/security.md`, compile and start the concurrent service:
 
 ```bash
-c++ -std=c++20 -Wall -Wextra -Werror -pthread \
-  flight/flight_service.cpp -o /tmp/orbit-flight-service
-/tmp/orbit-flight-service 127.0.0.1 9000 \
+make test-cpp
+/tmp/orbit_flight_service 127.0.0.1 9000 \
+  --ca /tmp/orbit-certificates/ca.pem \
+  --cert /tmp/orbit-certificates/flight.pem \
+  --key /tmp/orbit-certificates/flight.key \
+  --server-name ground.orbital.test \
   --count 100 \
   --interval-ms 100 \
   --capacity 1024

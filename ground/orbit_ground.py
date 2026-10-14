@@ -1,4 +1,4 @@
-"""Plaintext loopback ground receiver used by the M2 native test stage."""
+"""Authenticated ground receiver with an explicit loopback-only test transport."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import argparse
 import json
 import signal
 import socket
+import ssl
 import threading
 from dataclasses import asdict
 from pathlib import Path
@@ -86,9 +87,18 @@ def serve(
     ready_file: Path | None = None,
     max_receipts: int | None = None,
     stop_event: threading.Event | None = None,
+    tls_context: ssl.SSLContext | None = None,
+    allowed_client: str | None = None,
+    test_plaintext: bool = False,
 ) -> int:
     """Serve connections until stopped; return the number of acknowledged receipts."""
     own_stop_event = stop_event or threading.Event()
+    if tls_context is None and not test_plaintext:
+        raise ValueError("TLS context required")
+    if test_plaintext and host not in ("127.0.0.1", "localhost"):
+        raise ValueError("test plaintext transport requires loopback")
+    if tls_context is not None and not allowed_client:
+        raise ValueError("explicit client SAN allowlist identity required")
     storage = TelemetryStorage(database_path)
     receiver = GroundReceiver(storage)
 
@@ -113,11 +123,19 @@ def serve(
                 with connection:
                     connection.settimeout(10)
                     try:
+                        if tls_context is not None:
+                            connection = tls_context.wrap_socket(connection, server_side=True)
+                            names = [value for kind, value in connection.getpeercert().get("subjectAltName", ()) if kind == "DNS"]
+                            if allowed_client not in names:
+                                connection.close()
+                                continue
                         receiver.handle_connection(connection)
                     except (ProtocolError, OSError):
                         # A malformed or interrupted peer is isolated to its
                         # connection. It never reaches storage or receives ACK.
                         continue
+                    finally:
+                        connection.close()
     finally:
         storage.close()
 
@@ -125,7 +143,12 @@ def serve(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="OrbitalLink M2 plaintext ground receiver")
+    parser = argparse.ArgumentParser(description="OrbitalLink authenticated ground receiver")
+    parser.add_argument("--ca", type=Path)
+    parser.add_argument("--cert", type=Path)
+    parser.add_argument("--key", type=Path)
+    parser.add_argument("--allowed-client")
+    parser.add_argument("--test-plaintext", action="store_true", help="loopback test fixture transport only")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=0)
     parser.add_argument("--database", type=Path, required=True)
@@ -160,6 +183,17 @@ def main() -> int:
             storage.close()
 
     stop_event = threading.Event()
+    context = None
+    if not arguments.test_plaintext:
+        if not all((arguments.ca, arguments.cert, arguments.key, arguments.allowed_client)):
+            parser.error("TLS requires --ca --cert --key --allowed-client")
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.minimum_version = ssl.TLSVersion.TLSv1_3
+        context.verify_mode = ssl.CERT_REQUIRED
+        context.load_verify_locations(arguments.ca)
+        context.load_cert_chain(arguments.cert, arguments.key)
+    elif any((arguments.ca, arguments.cert, arguments.key, arguments.allowed_client)):
+        parser.error("test plaintext cannot be combined with TLS options")
 
     def request_stop(_signum: int, _frame: object) -> None:
         stop_event.set()
@@ -173,6 +207,9 @@ def main() -> int:
         ready_file=arguments.ready_file,
         max_receipts=arguments.max_receipts,
         stop_event=stop_event,
+        tls_context=context,
+        allowed_client=arguments.allowed_client,
+        test_plaintext=arguments.test_plaintext,
     )
     return 0
 

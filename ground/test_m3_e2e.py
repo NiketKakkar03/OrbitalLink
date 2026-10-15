@@ -343,6 +343,7 @@ def test_continuous_connect_failures_and_full_queue_shutdown_are_bounded(
 def test_stalled_peer_cannot_prevent_bounded_shutdown(
     tmp_path: Path, flight_service: Path
 ):
+    capacity = 4
     allow_reads = threading.Event()
     database = tmp_path / "stalled.db"
     with FaultGround(
@@ -353,7 +354,7 @@ def test_stalled_peer_cannot_prevent_bounded_shutdown(
             flight_service,
             ground.port,
             count=200,
-            capacity=4,
+            capacity=capacity,
             drain_ms=250,
             timeout=4,
         )
@@ -361,7 +362,11 @@ def test_stalled_peer_cannot_prevent_bounded_shutdown(
 
     assert elapsed < 3
     assert counters["generated"] == 200
-    assert counters["discarded_shutdown"] <= 4
+    # The plaintext fixture bounds queued samples and the single in-flight
+    # frame separately. A stalled ACK can hold that frame while acquisition
+    # refills all queue slots; scheduler timing determines whether this occurs.
+    assert counters["discarded_shutdown"] <= capacity + 1
+    assert counters["queue_high_watermark"] <= capacity
     assert counters["acknowledged"] == 0
     assert_final_accounting(counters)
 

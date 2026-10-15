@@ -357,6 +357,9 @@ void acquisition_loop(const Config& config, Shared& shared) {
             if(routine.category==4) {
                 routine.values[0]=static_cast<std::int32_t>(((monotonic_ns()-shared.started_ns)/1'000'000'000ULL)&0x7fffffffULL);
                 routine.values[1]=static_cast<std::int32_t>(state.generation>=7?state.generation-7:0);
+                // Source snapshot includes this generated record, staged here
+                // before its handoff to retention; earlier reports are delivered.
+                routine.values[2]=1;
                 routine.values[3]=static_cast<std::int32_t>((sequence+1)&0x7fffffffULL);
                 routine.values[4]=static_cast<std::int32_t>(sequence&0x7fffffffULL);
             }

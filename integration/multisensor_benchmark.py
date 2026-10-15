@@ -19,6 +19,14 @@ from ground.orbit_storage import TelemetryStorage
 from integration.run_checks import stop_process_group
 
 
+def valid_health_snapshot(sample):
+    """Snapshots conserve source reports modulo 2**31, independently of outbox."""
+    if sample.category != 4:
+        return True
+    uptime,resets,queued,generated,delivered,dropped=sample.values[:6]
+    return all(value>=0 for value in (uptime,resets,queued,generated,delivered,dropped)) and generated == ((queued+delivered+dropped)&0x7fffffff)
+
+
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--flight',type=Path,default=Path('/tmp/orbit_flight_service'))
@@ -82,6 +90,8 @@ def main():
         if len(samples)!=expected:failures.append('ground row count mismatch')
         if len({(s.flight_boot_id,s.telemetry_sequence) for s in samples})!=expected:failures.append('identity mismatch')
         if categories!=expected_categories:failures.append('category/event counts differ from declared profile')
+        if any(not valid_health_snapshot(sample) for sample in samples):
+            failures.append('health source snapshot counters do not conserve reports modulo2^31')
         p95=summary.get('source_to_ack_p95_upper_ms')
         if p95 is None or p95>1000:failures.append('source-to-durableACK p95 exceeds1second or unavailable')
         if args.seconds>=600 and elapsed<args.seconds-1:failures.append('baseline did not sustain full requested duration')

@@ -40,6 +40,9 @@ static inline int orbit_scenario_tick(uint64_t tick, uint32_t seed,
     case 4:
         routine->values[0]=(int32_t)((tick/10)&UINT64_C(0x7fffffff));
         routine->values[3]=(int32_t)(tick&UINT64_C(0x7fffffff));
+        /* Stateless fallback: all prior ticks handed off, none still queued.
+         * Runtime owners replace these with their actual source snapshots. */
+        routine->values[4]=routine->values[3];
         break;
     case 5:
         routine->values[0]=disturbed?0:(int32_t)(20+((tick*17+seed)%13));

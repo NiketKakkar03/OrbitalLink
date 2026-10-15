@@ -140,3 +140,15 @@ def test_cli_exposes_health_and_events(tmp_path):
     rows=[json.loads(line) for line in export.read_text().splitlines()]
     assert [row['category_name'] for row in rows]==['health','event']
     assert rows[0]['sample']['values']==list(health.values)
+
+
+@pytest.mark.parametrize('values,valid', [
+    ((600,0,1,10,9,0,0,0),True),
+    ((600,0,0,10,9,0,0,0),False),
+    ((600,1,2,0,2147483647,2147483647,0,0),True),
+    ((600,1,0,10,8,2,0,0),True),
+    ((600,1,-1,10,11,0,0,0),False),
+])
+def test_benchmark_health_snapshot_conservation(values,valid):
+    from integration.multisensor_benchmark import valid_health_snapshot
+    assert valid_health_snapshot(sample(4,values)) is valid

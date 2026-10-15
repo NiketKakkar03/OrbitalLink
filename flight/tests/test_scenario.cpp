@@ -22,6 +22,7 @@ int main() {
         }
         if(a.category==3 && tick>=200 && tick<260)assert(a.values[4]==1 && a.values[3]>1000);
         if(a.category==5 && tick>=200 && tick<260)assert(a.values[0]==0 && a.values[2]==1);
+        if(a.category==4)assert(a.values[3]==a.values[4] && a.values[2]==0 && a.values[5]==0);
         if(event)assert(e.category==6 && e.values[3]==1);
     }
     assert(counts[1]==120 && counts[2]==60 && counts[3]==300 && counts[4]==60 && counts[5]==60);
@@ -31,6 +32,7 @@ int main() {
     orbit_scenario_record health{},boundary_event{};
     orbit_scenario_tick(2'147'483'647ULL,42,&health,&boundary_event);
     assert(health.category==4 && health.values[3]==2'147'483'647);
+    assert(health.values[4]==health.values[3]);
     orbit_scenario_tick(2'147'483'657ULL,42,&health,&boundary_event);
     assert(health.category==4 && health.values[3]==9);
     orbit_scenario_tick(21'474'836'477ULL,42,&health,&boundary_event);

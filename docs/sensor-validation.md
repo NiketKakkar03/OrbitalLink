@@ -53,6 +53,10 @@ The first 600 second baseline used the initial integrated native scenario binary
 its exact executable hash is in `execution-identity.json`, with dirty-source
 status recorded. Subsequent refinements are validated by regression and guest
 runs rather than retroactively attributed to that binary.
+Those initial native runs predate the health snapshot conservation check: the
+native source omitted its one staged record from the queued field. The source
+and validator are now corrected. Their row-count and latency observations remain
+useful, but they are not evidence that the old health counters were consistent.
 
 | Scenario | Artifact | Result |
 |---|---|---|

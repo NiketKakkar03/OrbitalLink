@@ -22,6 +22,10 @@ is derived from the remaining database capacity at 256 bytes per sample.
 budget yields an initial bound of 87,168 records, about 2 hours 25 minutes at
 10 Hz when empty; this is a configured conservative bound, not a measured
 maximum throughput or guaranteed outage duration.
+Startup refuses a record limit below the existing backlog, or a byte budget below
+the existing database's page footprint. Drain the backlog before reducing limits.
+Persistent SQLite capacity failure is retried with at most eight transactions
+and a maximum batch of 64 evictions, then fails without committing partial loss.
 
 Acquisition commits each sample before it can be sent. Ground commits telemetry
 before ACKing it; flight deletes a retained record only after a matching ACK.

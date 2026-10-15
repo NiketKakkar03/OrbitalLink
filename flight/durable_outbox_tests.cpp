@@ -1,8 +1,12 @@
 #include "durable_outbox.hpp"
 #include <cassert>
 #include <chrono>
+#include <cerrno>
+#include <spawn.h>
+#include <stdexcept>
 #include <filesystem>
 #include <iostream>
+#include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -10,7 +14,76 @@ using orbit::DurableOutbox;
 orbit::TelemetrySample make_sample(std::uint64_t sequence,std::uint64_t boot=UINT64_MAX) {
     return {42,boot,sequence,7,static_cast<std::uint32_t>(sequence),123456789,21500,3300};
 }
-int main() {
+extern char** environ;
+
+pid_t spawn_helper(const std::string& executable,const std::string& mode,const std::string& path,int write_fd=-1,int close_fd=-1) {
+    std::vector<std::string> arguments{executable,"--child-mode",mode,path,std::to_string(write_fd)};
+    std::vector<char*> argv;
+    for(auto& argument:arguments)argv.push_back(argument.data());
+    argv.push_back(nullptr);
+    posix_spawn_file_actions_t actions;
+    const auto initialized=posix_spawn_file_actions_init(&actions);
+    if(initialized!=0)throw std::runtime_error("child file-actions initialization failed: "+std::to_string(initialized));
+    if(close_fd>=0) {
+        const auto added=posix_spawn_file_actions_addclose(&actions,close_fd);
+        if(added!=0){posix_spawn_file_actions_destroy(&actions);throw std::runtime_error("child close-action failed: "+std::to_string(added));}
+    }
+    pid_t child{};
+    const auto result=posix_spawn(&child,executable.c_str(),&actions,nullptr,argv.data(),environ);
+    posix_spawn_file_actions_destroy(&actions);
+    if(result!=0)throw std::runtime_error("cannot spawn SQLite helper "+mode+": "+std::to_string(result));
+    return child;
+}
+void expect_child(pid_t child,bool killed,const char* mode) {
+    int status{};
+    pid_t waited;
+    do{waited=waitpid(child,&status,0);}while(waited<0 && errno==EINTR);
+    const bool expected=waited==child && (killed?(WIFSIGNALED(status)&&WTERMSIG(status)==SIGKILL):(WIFEXITED(status)&&WEXITSTATUS(status)==0));
+    if(!expected) {
+        std::cerr<<"SQLite helper "<<mode<<" pid="<<child<<" wait="<<waited<<" raw_status="<<status;
+        if(WIFEXITED(status))std::cerr<<" exit="<<WEXITSTATUS(status);
+        if(WIFSIGNALED(status))std::cerr<<" signal="<<WTERMSIG(status);
+        std::cerr<<'\n';
+        throw std::runtime_error("unexpected SQLite helper termination");
+    }
+}
+[[noreturn]] void child_helper(const std::string& mode,const std::string& path,int write_fd) {
+    try {
+        if(mode=="committed") {
+            DurableOutbox outbox(path,262144,2);outbox.push(make_sample(4,123));_exit(0);
+        }
+        if(mode=="rollback") {
+            sqlite3* db{};
+            if(sqlite3_open(path.c_str(),&db)!=SQLITE_OK)throw std::runtime_error("cannot open rollback DB");
+            if(sqlite3_exec(db,"BEGIN IMMEDIATE; DELETE FROM samples; DELETE FROM loss",nullptr,nullptr,nullptr)!=SQLITE_OK)
+                throw std::runtime_error(sqlite3_errmsg(db));
+            _exit(0);
+        }
+        if(mode=="hot-journal") {
+            DurableOutbox owner(path,1024*1024,128);
+            sqlite3* db{};
+            if(sqlite3_open(path.c_str(),&db)!=SQLITE_OK)throw std::runtime_error("cannot open hot-journal DB");
+            const char* transaction=
+                "PRAGMA synchronous=FULL; PRAGMA fullfsync=ON;"
+                "PRAGMA cache_size=1; PRAGMA cache_spill=ON;"
+                "BEGIN IMMEDIATE;"
+                "UPDATE samples SET frame=zeroblob(length(frame));"
+                "UPDATE counters SET value=value+10000;"
+                "UPDATE loss SET count=count+10000;";
+            if(sqlite3_exec(db,transaction,nullptr,nullptr,nullptr)!=SQLITE_OK)throw std::runtime_error(sqlite3_errmsg(db));
+            if(sqlite3_db_cacheflush(db)!=SQLITE_OK)throw std::runtime_error(sqlite3_errmsg(db));
+            const char ready='R';
+            if(::write(write_fd,&ready,1)!=1)throw std::runtime_error("cannot signal crash barrier");
+            for(;;)pause();
+        }
+        throw std::runtime_error("unknown helper mode");
+    } catch(const std::exception& error) {
+        std::cerr<<"SQLite helper "<<mode<<": "<<error.what()<<'\n';_exit(14);
+    }
+}
+int main(int argc,char** argv) {
+    if(argc==5 && std::string(argv[1])=="--child-mode")child_helper(argv[2],argv[3],std::stoi(argv[4]));
+    const auto executable=std::filesystem::absolute(argv[0]).string();
     const auto directory=std::filesystem::temp_directory_path()/ ("orbit-outbox-tests-"+std::to_string(getpid()));
     std::filesystem::create_directory(directory);
     const auto path=(directory/"outbox.db").string();
@@ -41,13 +114,8 @@ int main() {
         outbox.acknowledge(*first);
     }
     // Crash before COMMIT restores both sample and its loss accounting.
-    const auto child=fork();assert(child>=0);
-    if(child==0) {
-        sqlite3* db{};if(sqlite3_open(path.c_str(),&db)!=SQLITE_OK)_exit(3);
-        if(sqlite3_exec(db,"BEGIN IMMEDIATE; DELETE FROM samples; DELETE FROM loss",nullptr,nullptr,nullptr)!=SQLITE_OK)_exit(4);
-        _exit(0);
-    }
-    int status{};waitpid(child,&status,0);assert(WIFEXITED(status)&&WEXITSTATUS(status)==0);
+    const auto child=spawn_helper(executable,"rollback",path);
+    expect_child(child,false,"rollback");
     {
         DurableOutbox outbox(path,262144,2);assert(outbox.snapshot().size==1 && outbox.losses().size()==2);
         auto next=outbox.claim();assert(next && next->telemetry_sequence==3);outbox.acknowledge(*next);
@@ -58,9 +126,8 @@ int main() {
         assert(counts.generated==counts.acknowledged+counts.dropped+counts.retained);
     }
     // A process exit immediately after a successful transaction retains data.
-    const auto committed=fork();assert(committed>=0);
-    if(committed==0){DurableOutbox outbox(path,262144,2);outbox.push(make_sample(4,123));_exit(0);}
-    waitpid(committed,&status,0);assert(WIFEXITED(status)&&WEXITSTATUS(status)==0);
+    const auto committed=spawn_helper(executable,"committed",path);
+    expect_child(committed,false,"committed");
     {
         DurableOutbox outbox(path,262144,2);auto next=outbox.claim();assert(next && next->flight_boot_id==123);outbox.acknowledge(*next);
     }
@@ -111,6 +178,47 @@ int main() {
         const auto after=outbox.accounting();
         assert(after.generated==before.generated && after.acknowledged==before.acknowledged && after.dropped==before.dropped && after.retained==before.retained);
         assert(outbox.losses().empty() && outbox.claim()->telemetry_sequence==0);
+    }
+    // Kill a writer after dirty pages reach the DB, while its rollback journal
+    // is live. A pipe barrier makes this a transaction-boundary test, with no
+    // scheduling delay or assumption about how quickly SQLite writes pages.
+    const auto hot=(directory/"hot-journal.db").string();
+    constexpr std::uint64_t hot_budget=1024*1024;
+    orbit::DurableAccounting original_accounting;
+    std::vector<orbit::DurableLoss> original_losses;
+    std::vector<std::vector<std::uint8_t>> original_frames;
+    {
+        DurableOutbox outbox(hot,hot_budget,128);
+        for(std::uint64_t index=0;index<160;++index)outbox.push(make_sample(index,987654321));
+        original_accounting=outbox.accounting();original_losses=outbox.losses();
+        for(std::uint64_t index=32;index<160;++index)
+            original_frames.push_back(orbit::encode_telemetry_sample(make_sample(index,987654321),0));
+        assert(original_accounting.retained==128 && original_accounting.dropped==32 && original_losses.size()==1);
+    }
+    int barrier[2];assert(pipe(barrier)==0);
+    const auto writer=spawn_helper(executable,"hot-journal",hot,barrier[1],barrier[0]);
+    ::close(barrier[1]);
+    char ready{};
+    const auto received=::read(barrier[0],&ready,1);::close(barrier[0]);
+    if(received!=1 || ready!='R'){expect_child(writer,false,"hot-journal before barrier");throw std::runtime_error("SQLite helper exited without crash barrier");}
+    const auto journal_bytes=std::filesystem::file_size(hot+"-journal");
+    assert(journal_bytes>512);
+    assert(std::filesystem::file_size(hot)+journal_bytes<=hot_budget);
+    assert(kill(writer,SIGKILL)==0);
+    expect_child(writer,true,"hot-journal SIGKILL");
+    {
+        DurableOutbox recovered(hot,hot_budget,128);
+        const auto counts=recovered.accounting();
+        assert(counts.generated==original_accounting.generated && counts.acknowledged==original_accounting.acknowledged && counts.dropped==original_accounting.dropped && counts.loss_acknowledged==original_accounting.loss_acknowledged && counts.retained==original_accounting.retained);
+        const auto reports=recovered.losses();
+        assert(reports.size()==original_losses.size());
+        const auto& loss=reports.front();const auto& original=original_losses.front();
+        assert(loss.id==original.id && loss.boot_id==original.boot_id && loss.first==original.first && loss.last==original.last && loss.count==original.count && loss.detail_complete==original.detail_complete);
+        for(const auto& frame:original_frames) {
+            const auto next=recovered.claim();assert(next && orbit::encode_telemetry_sample(*next,0)==frame);
+            recovered.acknowledge(*next);
+        }
+        assert(recovered.snapshot().size==0);
     }
     std::filesystem::remove_all(directory);
     std::cout<<"durable outbox restart, transaction rollback, immutable losses, ownership and disk budget checks passed\n";

@@ -16,7 +16,7 @@ struct DurableLoss {
 struct DurableAccounting {
     std::uint64_t generated{}, acknowledged{}, dropped{}, loss_acknowledged{}, retained{};
 };
-// One owner, FULL synchronous rollback-journal transactions. Claimed telemetry
+// One owner, EXTRA synchronous rollback-journal transactions. Claimed telemetry
 // and claimed loss reports remain on disk until an authenticated matching ACK.
 class DurableOutbox {
 public:
@@ -37,6 +37,7 @@ public:
     std::vector<DurableLoss> losses() const;
     RetentionQueueSnapshot snapshot() const;
     DurableAccounting accounting() const;
+    std::uint64_t synchronous_mode() const;
     std::uint64_t database_limit_bytes() const { return database_limit_; }
 private:
     void exec(const std::string& sql) const;

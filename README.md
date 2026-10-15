@@ -24,7 +24,7 @@ make doctor
 make check
 ```
 
-This validates both protocol fixtures, Python storage and protocol behavior,
+This validates shared protocol fixtures, Python storage and protocol behavior,
 C++ protocol behavior, compilation of the native sender, and the full native
 integration path. The integration test sends 10,000 deterministic samples,
 replays 100 duplicates, and verifies that SQLite contains exactly 10,000 rows.

@@ -95,6 +95,7 @@ int main(int argc,char** argv) {
     const auto path=(directory/"outbox.db").string();
     {
         DurableOutbox outbox(path,262144,2);
+        assert(outbox.synchronous_mode()==3);
         outbox.push(make_sample(0));outbox.push(make_sample(1));
         const auto claimed=outbox.claim();assert(claimed && claimed->telemetry_sequence==0);
         const auto dropped=outbox.push(make_sample(2));
@@ -106,6 +107,7 @@ int main(int argc,char** argv) {
     }
     {
         DurableOutbox outbox(path,262144,2);
+        assert(outbox.synchronous_mode()==3);
         auto first=outbox.claim();assert(first && orbit::encode_telemetry_sample(*first,0)==orbit::encode_telemetry_sample(make_sample(0),0));
         bool mismatch=false;
         try {outbox.acknowledge(make_sample(9));}catch(const std::exception&){mismatch=true;}

@@ -191,7 +191,9 @@ capacity one cannot always admit another
 sample. Startup refuses a limit reduction below the existing backlog. One process
 owns an outbox through an exclusive lock.
 
-SQLite uses DELETE journal mode, synchronous FULL and macOS fullfsync. A bounded
+SQLite now uses DELETE journal mode, synchronous EXTRA and macOS fullfsync. EXTRA
+adds the directory synchronization needed after journal removal; an actual VM
+power-cut test exposed a lost last commit under the earlier FULL setting. A bounded
 set of retry transactions handles page-cap exhaustion; unresolved storage errors
 fail explicitly instead of reporting success or silently losing committed state.
 The accounting equation across restarts is:
@@ -283,7 +285,7 @@ a sustained-throughput benchmark. See [driver details](driver.md).
 | M4 security/control | Mutual TLS, identity authorization, native commands and replay/deadline policy tested |
 | M5 guest | Passed two real boots: 7 retained samples + 100 new = 107 ground rows across two boot IDs |
 | M6 driver test source | Passed syscall/lifecycle gate and 100 driver-origin TLS samples |
-| M7 custom peripheral | ABI2 hub/IRQ driver implemented; actual QTest and short guest gates passed; full endurance gate tracked separately |
+| M7 custom peripheral | ABI2 hub/IRQ driver implemented; actual QTest, driver rebind contract and 600-second guest baseline passed; full roadmap acceptance remains separately tracked |
 | M8 fault/measurement | Native 600-second baseline and 100 Hz short measurement passed; overload/window/recovery tests expanded; full embedded fault matrix pending |
 | M9 release | Clean source tests and clean-checkout smoke passed; release, patch/license and operational work pending |
 
@@ -294,11 +296,20 @@ it does not yet rebuild and execute the entire guest/module matrix remotely.
 
 Validated implementation commit `3b3a7f0` passed
 [CI run 38752529854](https://github.com/NiketKakkar03/OrbitalLink/actions/runs/38752529854).
+The multisensor runtime correction `5f50e65` passed
+[CI run 38793706847](https://github.com/NiketKakkar03/OrbitalLink/actions/runs/38793706847)
+on Ubuntu and macOS. A separately identified embedded image passed a 600-second
+baseline with 6,060 reports, zero source/outbox drops and source-to-ACK p95 at
+most 48 ms. See
+[sensor validation](sensor-validation.md) for exact tested-image identities and
+the separate native and embedded results.
 Local embedded evidence is retained, ignored by Git, at:
 
 - `build/guest-evidence/m5-run-005/`: result, manifest and both serial runs.
 - `build/guest-evidence/m6-run-001/`: result, manifest, executable hashes, serial
   output and extracted syscall/lifecycle/kernel artifacts.
+- `build/guest-evidence/m7-baseline-001/`: custom-device contract, 600-second
+  typed run, clock/resource measurements and image manifest.
 
 These directories contain no copied private keys. They are local evidence,
 not a published release archive. Earlier failed attempts were preserved in the

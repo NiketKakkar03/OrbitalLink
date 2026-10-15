@@ -90,6 +90,9 @@ def main():
     p.add_argument('--interval-ms', type=int, default=10)
     p.add_argument('--seed', type=int, default=1)
     p.add_argument('--storage-batch', type=int, default=1)
+    p.add_argument('--outbox-probe', type=Path, help='cross-compiled read-only snapshot helper for crash gate')
+    p.add_argument('--power-cut', action='store_true', help='kill QEMU while typed flight is live after a proven committed prefix')
+    p.add_argument('--inspect-outbox', action='store_true', help='recover/inspect persisted SQLite state then power off')
     args = p.parse_args()
     if not 1 <= args.port <= 65535 or not 0 <= args.count <= 10000 or args.replay_count < 0 or args.timeout < 1 or not 1 <= args.storage_batch <= 16:
         p.error('port/count/timeout outside supported range')
@@ -143,6 +146,35 @@ def main():
             console.wait(rb'\r?\nORBIT_CREDENTIALS_READY\r?\n', 20)
             console.send("mkdir -p /var/lib/orbit; blkid /dev/vdb | grep -q 'LABEL=\"orbit-state\"' && mount /dev/vdb /var/lib/orbit && printf '\\nORBIT_STATE_MOUNTED\\n'")
             console.wait(rb'\r?\nORBIT_STATE_MOUNTED\r?\n', 20)
+            probe_digest = None
+            if args.outbox_probe:
+                probe = args.outbox_probe.read_bytes()
+                probe_digest = __import__('hashlib').sha256(probe).hexdigest()
+                encoded = base64.b64encode(probe).decode()
+                console.send(': > /tmp/orbit-outbox-probe.b64')
+                for offset in range(0,len(encoded),512):
+                    console.send(f"printf '%s' '{encoded[offset:offset+512]}' >> /tmp/orbit-outbox-probe.b64")
+                    if offset % 4096 == 3584:
+                        marker = f'ORBIT_PROBE_CHUNK_{offset}'
+                        console.send(f"printf '\\n{marker}\\n'")
+                        console.wait(rb'\r?\n'+marker.encode()+rb'\r?\n',20)
+                console.send('base64 -d /tmp/orbit-outbox-probe.b64 > /tmp/orbit-outbox-probe; chmod 700 /tmp/orbit-outbox-probe; /usr/bin/openssl dgst -sha256 /tmp/orbit-outbox-probe')
+                console.wait(probe_digest.encode()+rb'\r?\n',20)
+            if args.inspect_outbox:
+                if not probe_digest:
+                    raise RuntimeError('outbox inspection requires --outbox-probe')
+                console.send("/tmp/orbit-outbox-probe /var/lib/orbit/outbox.db 0; orbit_probe_rc=$?; printf '\\nORBIT_PROBE_EXIT=%s\\n' \"$orbit_probe_rc\"")
+                snapshot = json.loads(console.wait(rb'ORBIT_OUTBOX=(\{[^\r\n]+\})',30).group(1))
+                probe_exit = console.wait(rb'\r?\nORBIT_PROBE_EXIT=(\d+)\r?\n',20)
+                if probe_exit.group(1) != b'0':
+                    raise RuntimeError('persisted outbox inspection/recovery failed')
+                console.send('poweroff'); child.wait(timeout=20)
+                if child.returncode:
+                    raise RuntimeError('recovery inspection shutdown failed')
+                (args.artifacts / 'result.json').write_text(json.dumps({'status':'passed',
+                    'gate':'SQLite persisted state recovered/inspected after VM power cut',
+                    'snapshot':snapshot,'probe_sha256':probe_digest},indent=2)+'\n')
+                return
             if args.sensors or args.sensor_contract:
                 console.send("orbit_sensor_module=$(find /lib/modules -name orbit_sensors.ko | head -n 1); test -n \"$orbit_sensor_module\" && insmod \"$orbit_sensor_module\" && test -c /dev/orbit_sensors && printf '\\nORBIT_SENSORS_READY\\n'")
                 console.wait(rb'\r?\nORBIT_SENSORS_READY\r?\n', 20)
@@ -177,6 +209,24 @@ def main():
                 cmd += ['--source', 'sensors', '--device', '/dev/orbit_sensors',
                         '--send-window', '32', '--priority-scheduling', '1', '--io-timeout-ms', '2000',
                         '--storage-batch', str(args.storage_batch)]
+            if args.power_cut:
+                if not args.sensors or not args.offline_seed or not probe_digest:
+                    raise RuntimeError('power-cut gate requires sensors/offline-seed/outbox-probe')
+                invocation = shlex.join(cmd) + ' > /var/lib/orbit/flight-summary.json 2>/var/lib/orbit/flight-stderr.log & orbit_flight_pid=$!; '
+                invocation += 'orbit_probe_attempt=0; until /tmp/orbit-outbox-probe /var/lib/orbit/outbox.db 110; do orbit_probe_attempt=$((orbit_probe_attempt+1)); test "$orbit_probe_attempt" -lt 30 && kill -0 "$orbit_flight_pid" 2>/dev/null || break; sleep 1; done; '
+                invocation += "kill -0 \"$orbit_flight_pid\" && printf '\\nORBIT_LIVE_FLIGHT_PID=%s\\n' \"$orbit_flight_pid\"; wait \"$orbit_flight_pid\""
+                console.send(invocation)
+                snapshot = json.loads(console.wait(rb'ORBIT_OUTBOX=(\{[^\r\n]+\})',90).group(1))
+                console.wait(rb'\r?\nORBIT_LIVE_FLIGHT_PID=(\d+)\r?\n',10)
+                if snapshot['retained'] < 110 or snapshot['acked'] or snapshot['dropped'] or snapshot['generated'] != snapshot['retained'] or len(snapshot['frames']) != snapshot['retained']:
+                    raise RuntimeError('pre-crash committed prefix is not bounded and loss-free')
+                child.kill(); child.wait(timeout=20)
+                if child.returncode != -9:
+                    raise RuntimeError('QEMU was not terminated by the intended SIGKILL')
+                (args.artifacts / 'result.json').write_text(json.dumps({'status':'passed',
+                    'gate':'QEMU SIGKILL while flight live after committed typed prefix; recovery verdict separate',
+                    'snapshot':snapshot,'probe_sha256':probe_digest,'qemu_returncode':child.returncode},indent=2)+'\n')
+                return
             invocation = shlex.join(cmd)
             if args.sensors:
                 invocation += " > /var/lib/orbit/flight-summary.json 2>/var/lib/orbit/flight-stderr.log & orbit_flight_pid=$!; "

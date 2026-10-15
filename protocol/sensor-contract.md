@@ -1,4 +1,4 @@
-# Multisensor contract (implementation target)
+# Multisensor contract
 
 Approved scope: power, thermal, simplified orientation, synthetic radiation;
 health and bounded events mandatory; interacting deterministic scenarios. Baseline
@@ -37,8 +37,8 @@ M7 ABI2: new separate struct orbit_sensor_sample (do not alter ABI1) common
 abi_version u32,category u32,generation u32,sequence u32,monotonic_ns u64,
 quality u32,schema u32,values[8]i32 =64 bytes. New device path and driver/source
 mode may use separate ABI2 read interface while preserving /dev/orbit_telemetry.
-Register/IRQ contract to be implemented/documented by device owner. Use one
-custom QEMU multisensor hub with categories, not six independent QEMU models.
+The implemented [register/IRQ contract](../qemu/README.md) uses one custom QEMU
+multisensor hub with categories, rather than six independent QEMU models.
 No physical-accuracy or CCSDS-conformance claim.
 
 Normal profile per second: power2 thermal1 orientation5 health1 science1.

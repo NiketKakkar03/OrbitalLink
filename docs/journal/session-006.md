@@ -34,8 +34,12 @@ storage transactions under QEMU TCG could not keep up. It reported 15 outbox dro
 and source-to-ACK p95 around four seconds. This is retained as a failed performance
 observation, not a passing target. A short embedded 10 Hz run delivered all 121
 records, p95 at most 190 ms, with complete clock coverage and drift within bounds.
-The complete embedded 600-second gate and optional batching comparison are
-tracked in the validation document once their final artifacts are available.
+The complete embedded 600-second gate subsequently passed all 6,060 reports,
+zero source/outbox drops, p95 at most 48 ms, consistent health snapshots and clock
+coverage. Its 61 RSS measurements passed the tightened memory oracle. The
+corrected native 100 Hz repeat also passed all 3,030 reports and consistent health
+snapshots, p95 at most 9 ms. Exact artifacts and the remaining batching/crash
+comparisons are tracked in the validation document.
 
 Overload verification uses a deterministic first-ACK barrier rather than assuming
 a particular SSD speed. A finite shutdown drain may leave committed telemetry or

@@ -27,6 +27,18 @@ Newer benchmark runs copy/hash their executable before launch so another build
 cannot change the executed artifact. Credentials stay in a private ignored
 subdirectory; do not publish that directory as a release artifact.
 
+After building the patched image using [guest setup](guest.md), run inside the
+Linux builder, with a fresh output directory for every attempt:
+
+```sh
+python3 qemu/test_mmio.py --qemu /work/guest/output/host/bin/qemu-system-aarch64 --output /work/evidence/new-qtest
+python3 guest/run_m7_gate.py --work /work/guest --output /work/evidence/new-baseline --ticks 6000 --period-ms 100 --seed 1 --storage-batch 1
+```
+
+The guest runner first checks the actual driver contract, including rebind,
+then boots its separate baseline state disk. Native and guest resource clocks
+and evidence are kept separate. Never reuse another run's writable state disk.
+
 Acceptance: exact durable sample identity/count reconciliation, all categories,
 all expected events, no source/outbox drops under the healthy baseline, 95th
 percentile source-to-durable-ACK <=1 second, complete latency sample coverage and
@@ -62,11 +74,47 @@ useful, but they are not evidence that the old health counters were consistent.
 |---|---|---|
 |600 seconds,10 routine Hz|`build/multisensor/baseline-600s-001/result.json`|6,060 stored;0 outbox drops;source-to-ACKp95<=13 ms;no measured memory growth|
 |30 seconds,100 routine Hz|`build/multisensor/performance-100hz-001/result.json`|3,030 stored;0 outbox drops;source-to-ACKp95<=27 ms|
+|30 seconds,100 routine Hz, corrected health counters|`build/multisensor/performance-100hz-final-001/result.json`|3,030 stored; zero drops; source-to-ACK p95 <=9 ms; exact health/category checks pass|
+|600 seconds,10 routine Hz, corrected health counters, pre-directory-sync fix|`build/multisensor/baseline-600s-final-001/result.json`|6,060 stored; zero drops; source-to-ACK p95 <=12 ms; exact health/category/resource checks pass|
 |Slow durable TLS receiver versus fast producer|`ground/test_load_e2e.py`|Capacity 32/window 8 stays bounded; intentional drops and their durable loss ACK counts reconcile; retained rows recover after the finite drain deadline|
 
 The 100 Hz result is a 30 second performance observation; it is not a 600 second
 100 Hz endurance gate. Baseline speed is 10 Hz. Device results must be reported
 separately from the native scenario source.
+
+## Embedded measurements on the M1 Pro setup
+
+The actual custom QEMU hub → IRQ driver → flight → mutual-TLS ground path passed
+the full 600-second, 10 Hz baseline in
+`build/guest-evidence/m7-baseline-001/result.json`. It stored and acknowledged all
+6,060 reports, with the same category counts as the native baseline and zero
+driver/outbox drops or retained records. Source-to-durable-ACK p95 was at most
+48 ms, covering all 6,060 samples. Driver totals were 6,060 generated, enqueued
+and delivered, with zero queued at the final snapshot. All 60 transition events
+were observed without event coalescing or overflow.
+
+Clock drift was 9,681 ns against the declared 1,046,392 ns budget. The 61 guest
+RSS measurements exceeded the required 48; final-versus-initial quarter mean
+growth was about 0.55 MiB against the 32 MiB limit. Process peak RSS was
+10,637,312 bytes. The tightened memory oracle also passed against the retained
+raw log in `posthoc-memory-validation.json`. Host wall time was 614.61 seconds,
+including boot and shutdown. Image and executable identities identify the
+actual tested build; later native-only counter fixes are not attributed to it.
+
+These baseline measurements used DELETE/FULL before the directory-sync fix;
+they establish healthy-link behavior, not power-cut retention. The first actual
+VM power-cut gate (`build/guest-evidence/m7-crash-001/`) exposed a missing last
+commit: 115 records confirmed committed before SIGKILL, 114 after recovery.
+SQLite documents this DELETE/FULL limitation; EXTRA additionally synchronizes
+the journal-deletion directory. The failed artifact is preserved, and passing
+recovery must be established separately after tightening the storage setting.
+See [SQLite synchronous modes](https://www.sqlite.org/pragma.html#pragma_synchronous).
+
+An earlier short 100 Hz guest attempt failed: 15 outbox drops and source-to-ACK
+p95 around four seconds under per-record FULL storage transactions and TCG.
+That failure remains in the evidence. A passing native 100 Hz result does not
+establish the same embedded performance. Optional ACK batching is measured
+separately; it does not remove acquisition's per-record commit cost.
 
 ## Transmission and priority behavior
 
@@ -114,6 +162,11 @@ and stable identities; a clean reboot alone is not an abrupt-power-loss test.
 
 ## Release preparation gates
 
+The runtime correction at `5f50e65` passed Ubuntu and macOS native, sanitizer,
+real-TLS sanitizer and supported macOS TSan checks in
+[CI run 38793706847](https://github.com/NiketKakkar03/OrbitalLink/actions/runs/38793706847).
+Guest evidence remains a separate local gate; CI does not execute QEMU endurance.
+
 Before calling this a release:
 
 - Finish and retain custom-device guest smoke/endurance and crash-recovery results.
@@ -136,7 +189,7 @@ Before calling this a release:
 No release tag or publication is implied by passing an individual benchmark.
 
 Optional `--storage-batch 1..16` groups only already-arrived matching ACKs into
-one FULL-synchronous deletion transaction. Default 1 preserves the original
+one EXTRA-synchronous deletion transaction. Default 1 preserves single-record
 commit path. A batch never waits to become full. Unknown/duplicate ACKs retain
 unacknowledged samples; a valid prefix commits independently before reconnect.
 Acquisition still commits samples individually. The optimization does not imply

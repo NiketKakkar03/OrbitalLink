@@ -69,6 +69,17 @@ class TelemetryStorage:
     def __init__(self, database_path: str | Path):
         self.connection = sqlite3.connect(database_path)
         try:
+            # DELETE+EXTRA syncs the journal's directory after unlinking it.
+            # FULL alone can roll back the latest commit after an OS power cut,
+            # which would invalidate the ground commit-before-ACK contract.
+            self.connection.execute("PRAGMA journal_mode=DELETE")
+            self.connection.execute("PRAGMA synchronous=EXTRA")
+            self.connection.execute("PRAGMA fullfsync=ON")
+            journal = self.connection.execute("PRAGMA journal_mode").fetchone()[0]
+            synchronous = self.connection.execute("PRAGMA synchronous").fetchone()[0]
+            fullfsync = self.connection.execute("PRAGMA fullfsync").fetchone()[0]
+            if (journal, synchronous, fullfsync) != ("delete", 3, 1):
+                raise RuntimeError("ground storage requires DELETE/EXTRA durability settings")
             self._create_table()
         except Exception:
             self.connection.close()

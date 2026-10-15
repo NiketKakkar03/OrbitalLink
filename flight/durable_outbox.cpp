@@ -53,7 +53,17 @@ DurableOutbox::DurableOutbox(const std::string& path,std::uint64_t bytes,std::si
         if(sqlite3_open_v2(path.c_str(),&db_,SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE|SQLITE_OPEN_FULLMUTEX,nullptr)!=SQLITE_OK)
             throw std::runtime_error("cannot open outbox");
         sqlite3_busy_timeout(db_,1000);
-        exec("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; PRAGMA fullfsync=ON; PRAGMA page_size=4096; PRAGMA temp_store=MEMORY;");
+        // DELETE commits by unlinking the rollback journal. EXTRA also syncs
+        // that directory entry: FULL alone can lose the last committed
+        // transaction after an OS/VM power cut. Keep macOS fullfsync enabled.
+        exec("PRAGMA journal_mode=DELETE; PRAGMA synchronous=EXTRA; PRAGMA fullfsync=ON; PRAGMA page_size=4096; PRAGMA temp_store=MEMORY;");
+        {
+            auto journal=prepare(db_,"PRAGMA journal_mode");
+            if(sqlite3_step(journal.get())!=SQLITE_ROW ||
+               std::string(reinterpret_cast<const char*>(sqlite3_column_text(journal.get(),0)))!="delete" ||
+               scalar("PRAGMA synchronous")!=3 || scalar("PRAGMA fullfsync")!=1)
+                throw std::runtime_error("outbox requires DELETE/EXTRA durability settings");
+        }
         // Conservatively reserve two database lengths for rollback journal and
         // its per-page/header overhead, plus 64 KiB. No WAL sidecar can grow.
         const auto pages=(bytes-65536)/3/4096;
@@ -259,6 +269,9 @@ void DurableOutbox::acknowledge_loss(std::uint64_t id) {
 RetentionQueueSnapshot DurableOutbox::snapshot() const {
     std::lock_guard lock(mutex_);
     return {capacity_,static_cast<std::size_t>(scalar("SELECT count(*) FROM samples")),high_watermark_,accepted_,popped_,0,dropped_,0,false};
+}
+std::uint64_t DurableOutbox::synchronous_mode() const {
+    std::lock_guard lock(mutex_);return scalar("PRAGMA synchronous");
 }
 DurableAccounting DurableOutbox::accounting() const {
     std::lock_guard lock(mutex_);

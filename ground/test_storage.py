@@ -31,6 +31,32 @@ def test_stores_and_loads_sample(tmp_path):
     storage.close()
 
 
+def test_power_cut_durability_settings_are_applied_on_every_open(tmp_path):
+    path = tmp_path / "durability.db"
+    # A caller's previous connection settings cannot weaken this connection.
+    with sqlite3.connect(path) as previous:
+        assert previous.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+        previous.execute("PRAGMA synchronous=OFF")
+    previous.close()
+    for iteration in range(2):
+        storage = TelemetryStorage(path)
+        try:
+            assert storage.connection.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+            assert storage.connection.execute("PRAGMA synchronous").fetchone()[0] == 3
+            assert storage.connection.execute("PRAGMA fullfsync").fetchone()[0] == 1
+            if iteration == 0:
+                assert storage.store_sample(make_sample())
+            else:
+                assert storage.load_samples() == [make_sample()]
+        finally:
+            storage.close()
+
+
+def test_nonpersistent_ground_storage_is_rejected():
+    with pytest.raises(RuntimeError, match="durability settings"):
+        TelemetryStorage(":memory:")
+
+
 def test_duplicate_sample_is_idempotent(tmp_path):
     storage = TelemetryStorage(tmp_path / "telemetry.db")
     sample = make_sample()

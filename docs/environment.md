@@ -2,9 +2,10 @@
 
 The native M0–M3 path supports macOS and Linux. Install Git, Make, a C++20
 compiler with pthread support (Apple Clang or GCC), and Python 3.11 or newer.
-M4 also requires the OpenSSL CLI and development headers/libraries, plus a Python
+The secure durable path also requires SQLite development headers/libraries and
+the OpenSSL CLI/development headers/libraries, plus a Python
 SSL build supporting TLS 1.3. On macOS use `brew install openssl@3`; on Ubuntu
-install `build-essential libssl-dev python3-venv`. Make detects Homebrew's
+install `build-essential libssl-dev libsqlite3-dev python3-venv`. Make detects Homebrew's
 `openssl@3` prefix; set `OPENSSL_PREFIX` for another installation.
 The ground station uses Python's standard-library SQLite implementation.
 

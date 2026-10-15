@@ -65,5 +65,6 @@ OS storage operations; a blocked kernel/filesystem cannot be made interruptible
 by the SQLite timeout. Process-crash recovery does not guarantee recovery from
 disk destruction, filesystem corruption, or storage that ignores synchronization.
 
-The read-only operator `query-state` reports the current device settings and effect
-count without reapplying a command; see [operator setup](security.md).
+The read-only operator `query-state` reports the native fake-device settings and
+effect count without reapplying a command. Device-mode state querying is rejected
+until a truthful driver state UAPI is implemented; see [operator setup](security.md).

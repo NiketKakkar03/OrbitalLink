@@ -1,6 +1,6 @@
 # OrbitalLink Protocol Specification
 
-Status: implemented through M2
+Status: v1 telemetry, commands, state snapshots and durable loss reports implemented
 Version: 1
 
 ## 1. Purpose
@@ -81,8 +81,13 @@ Total:
 | 3 | COMMAND_SESSION | Flight announces connection-bound command context |
 | 4 | COMMAND_REQUEST | Ground asks flight to do something |
 | 5 | COMMAND_RESULT | Flight reports applied or rejected command |
+| 6 | STATE_SNAPSHOT | Correlated read-only native device state |
+| 7 | LOSS_REPORT | Durable bounded retention-loss information |
+| 8 | LOSS_ACK | Ground confirms durable loss-report storage |
 
-M2 implements `TELEMETRY_SAMPLE` and `TELEMETRY_ACK`.
+M2 introduced telemetry and ACKs. Later sections define the implemented command,
+state and loss contracts. The Linux device source currently supports only the
+set-period command; other controls and state queries require additional UAPI.
 
 ## 6. TELEMETRY_SAMPLE Payload
 

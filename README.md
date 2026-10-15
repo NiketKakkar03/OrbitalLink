@@ -1,7 +1,9 @@
 # OrbitalLink
 
 OrbitalLink is a learning project that builds a secure embedded telemetry path in
-small milestones. The current implementation runs natively on macOS/Linux:
+small milestones. Start with the [complete project walkthrough](docs/project-overview.md)
+for architecture, implemented behavior, validation evidence and remaining work.
+The implementation runs natively on macOS/Linux and inside an ARM64 Linux guest:
 
 ```text
 C++ acquisition thread -> bounded retention queue -> C++ network thread

@@ -1,7 +1,7 @@
 # Linux driver validation
 
-The driver is a test-backend prototype. Host C contract checks do not establish
-that it builds, loads, or survives Linux concurrency. Load it only in the pinned
+The timer-driven test backend passed its first matched-kernel guest runtime
+gate on 2026-10-15. Host C contract checks alone do not establish runtime safety. Load it only in the pinned
 QEMU guest, never in macOS or Docker Desktop's underlying Linux kernel.
 
 After the M5 image has built, cross-compile against that exact kernel tree:
@@ -22,7 +22,11 @@ holds the device. The harness contains destructive device-detach scenarios;
 use only the disposable development guest. Retain serial output and the exact
 kernel/module hashes. A successful native contract check is not a substitute.
 
-M6 runtime validation is pending. M7 still requires a real emulated MMIO/IRQ
+M6 runtime gate passed in `build/guest-evidence/m6-run-001/result.json`: the
+syscall suite, 100 load/unbind/rebind/unload cycles, clean kernel diagnostic
+scan, and 100 device-origin mutual-TLS samples committed at ground. The database
+checks generation, consecutive device sequences, deterministic temperatures,
+3,300 mV voltage and positive monotonic timestamps. Guest shutdown also passed. M7 still requires a real emulated MMIO/IRQ
 backend plus driver binding; the timer-driven test backend alone is not M7.
 
 
@@ -47,9 +51,9 @@ A Buildroot external package can use the `kernel-module` infrastructure with
 the syscall harness. Keep the package test-only and install its module via the
 kernel-module infrastructure so kernel release paths remain correct.
 
-Remaining M6 gates: compile the module against the exact kernel, install it and
-the harness into a disposable guest image, run `tests/run_guest_tests.sh`, retain
-serial/kernel logs and hashes, then connect flight acquisition to the driver.
+The matched Linux 6.12.27 module, installed syscall harness and flight adapter
+were tested together in the disposable guest. Serial evidence includes the
+syscall/lifecycle output and kernel logs.
 The syscall suite now includes invalid ABI/reserved inputs and inaccessible
 ioctl buffers in addition to read faults. Its detach loops must pass before M6
 can be called runtime validated.
@@ -66,4 +70,5 @@ flight accepts only the rate command, and reports success after the ioctl
 succeeds. Enable, disable, reset, clear-fault and live state-query commands are
 rejected until real driver controls/state are implemented. Driver FIFO loss
 counters are separate from the durable outbox's acknowledged loss reports.
-Actual device-to-ground validation remains required.
+Device-to-ground validation passed for this test backend. Wider fault injection,
+benchmarking and real MMIO/IRQ acquisition remain later gates.

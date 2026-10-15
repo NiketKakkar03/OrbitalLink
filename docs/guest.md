@@ -35,7 +35,7 @@ ARM64 builder was built successfully and its Linux tool preflight passed.
 The complete cross-toolchain, kernel, QEMU, libraries, rootfs and flight image
 built successfully. M5 passed in `build/guest-evidence/m5-run-005/result.json`: two
 real guest boots delivered 107 authenticated ground rows, with original boot
-identity counts of seven and 100. Driver runtime validation remains a separate gate.
+identity counts of seven and 100. The matched driver runtime gate also passed; see [driver evidence](driver.md).
 
 The supported Buildroot 2025.02.18 LTS release was selected from the
 [official download page](https://buildroot.org/download.html), with exact Git
@@ -82,3 +82,15 @@ ordering stable on the pinned machine. The runner verifies the state-disk label
 before mounting it. Serial parsing normalizes CRLF variants while retaining raw
 serial evidence; temporary credentials are provisioned only after guest echo is
 confirmed disabled.
+
+The checked-in defconfig now also installs the test driver. After building it,
+run the separate driver gate in Linux:
+
+```sh
+python3 guest/run_gate.py --work /work/guest --output /work/evidence/m6-run-002 --driver-tests
+```
+
+It uses a fresh state disk, runs the installed syscall/lifecycle harness for 100
+cycles, then verifies 100 real driver records at ground. The first successful
+runtime evidence is under `build/guest-evidence/m6-run-001/`. The serial log
+contains the harness output and kernel diagnostics, without private keys.

@@ -170,8 +170,8 @@ The ARM64 cross-toolchain, kernel and complete image build pass in the Linux
 builder on Apple Silicon; see [guest setup](docs/guest.md).
 Guest boot and two-boot persistent replay passed: seven retained samples plus
 100 new samples reached durable ground storage over mutual TLS.
-The [driver test backend and flight adapter](docs/driver.md) have host contract
-and native adapter tests; driver syscall/lifecycle testing,
-custom QEMU MMIO/IRQ acquisition, and the full embedded fault/benchmark suite
+The [driver test backend and flight adapter](docs/driver.md) passed the Linux
+syscall suite, 100 lifecycle cycles and a 100-sample driver-to-ground TLS gate.
+Custom QEMU MMIO/IRQ acquisition and the full embedded fault/benchmark suite
 remain separate completion gates. Native tests establish the host telemetry
 path only. See [the roadmap](OrbitalLink_Roadmap.md) for the dependent milestones.

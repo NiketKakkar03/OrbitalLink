@@ -11,8 +11,13 @@ from ground.orbit_storage import TelemetryStorage
 from ground.orbit_protocol import LOSS_ACK, decode_frame
 
 
-def run(executable,path,port,count,boot=101,capacity=16):
-    process=subprocess.run([str(executable),'127.0.0.1',str(port),'--outbox',str(path),'--count',str(count),'--boot-id',str(boot),'--interval-ms','0','--capacity',str(capacity),'--drain-ms','300','--connect-timeout-ms','100','--io-timeout-ms','100'],capture_output=True,text=True,timeout=6)
+def run(executable,path,port,count,boot=101,capacity=16,*,recover=False):
+    # Offline/intentional lost-ACK runs should finish quickly. Recovery tests
+    # require several FULL-synchronous transactions on both peers; they exercise
+    # correctness within the supported 3s drain, not a 100ms filesystem benchmark.
+    drain_ms=3000 if recover else 300
+    io_timeout_ms=1000 if recover else 100
+    process=subprocess.run([str(executable),'127.0.0.1',str(port),'--outbox',str(path),'--count',str(count),'--boot-id',str(boot),'--interval-ms','0','--capacity',str(capacity),'--drain-ms',str(drain_ms),'--connect-timeout-ms','100','--io-timeout-ms',str(io_timeout_ms)],capture_output=True,text=True,timeout=8)
     assert process.returncode==0,process.stderr
     return json.loads(process.stdout)
 
@@ -22,15 +27,30 @@ def pending(path):
         return [FrameParser().feed(bytes(row[0]))[0][1] for row in db.execute('SELECT frame FROM samples ORDER BY id')]
 
 
-def receiver(database,listener):
+def receiver(database,listener,handler=None):
+    ready=threading.Event();errors=[]
     def work():
-        storage=TelemetryStorage(database)
+        storage=None
         try:
+            storage=TelemetryStorage(database)
+            ready.set()
             with listener.accept()[0] as connection:
-                GroundReceiver(storage).handle_connection(connection)
-        finally:storage.close()
-    thread=threading.Thread(target=work);thread.start()
+                if handler is None:GroundReceiver(storage).handle_connection(connection)
+                else:handler(storage,connection)
+        except BaseException as error:errors.append(error)
+        finally:
+            ready.set()
+            if storage is not None:storage.close()
+    thread=threading.Thread(target=work);thread.errors=errors;thread.start()
+    assert ready.wait(5), "ground storage did not become ready"
+    assert not errors, errors
     return thread
+
+
+def join_receiver(worker):
+    worker.join(5)
+    assert not worker.is_alive(), "ground receiver did not stop"
+    assert not worker.errors, worker.errors
 
 
 def test_offline_restart_keeps_original_identity_and_payload(tmp_path,flight_service):
@@ -41,9 +61,9 @@ def test_offline_restart_keeps_original_identity_and_payload(tmp_path,flight_ser
     with socket.socket() as listener:
         listener.bind(('127.0.0.1',0));listener.listen();listener.settimeout(5)
         worker=receiver(database,listener)
-        result=run(flight_service,path,listener.getsockname()[1],0,boot=202)
-        worker.join(5);assert not worker.is_alive()
-    assert result['acknowledged']==4 and pending(path)==[]
+        result=run(flight_service,path,listener.getsockname()[1],0,boot=202,recover=True)
+        join_receiver(worker)
+    assert result['acknowledged']==4 and pending(path)==[], result
     assert result['durable_generated'] == 4
     assert result['durable_acknowledged'] == 4
     assert result['durable_retained'] == 0
@@ -57,29 +77,28 @@ def test_ground_commit_lost_ack_replayed_without_duplicate(tmp_path,flight_servi
     path=tmp_path/'outbox.db';database=tmp_path/'ground.db'
     run(flight_service,path,unused_port(),1)
     original=pending(path)[0]
-    def drop_ack(listener):
-        storage=TelemetryStorage(database)
-        try:
-            with listener.accept()[0] as peer:
-                parser=FrameParser()
-                while True:
-                    frames=parser.feed(peer.recv(4096))
-                    if frames:
-                        _,sample=frames[0];assert sample==original
-                        storage.store_sample(sample)
-                        return
-        finally:storage.close()
+    def drop_ack(storage,peer):
+        parser=FrameParser()
+        while True:
+            chunk=peer.recv(4096)
+            assert chunk, "flight disconnected before sending its retained sample"
+            frames=parser.feed(chunk)
+            if frames:
+                _,sample=frames[0];assert sample==original
+                storage.store_sample(sample)
+                return
     with socket.socket() as listener:
         listener.bind(('127.0.0.1',0));listener.listen();listener.settimeout(5)
-        worker=threading.Thread(target=drop_ack,args=(listener,));worker.start()
+        worker=receiver(database,listener,drop_ack)
         result=run(flight_service,path,listener.getsockname()[1],0)
-        worker.join(5)
+        join_receiver(worker)
     assert result['acknowledged']==0 and pending(path)==[original]
     with socket.socket() as listener:
         listener.bind(('127.0.0.1',0));listener.listen();listener.settimeout(5)
         worker=receiver(database,listener)
-        assert run(flight_service,path,listener.getsockname()[1],0)['acknowledged']==1
-        worker.join(5)
+        result=run(flight_service,path,listener.getsockname()[1],0,recover=True)
+        join_receiver(worker)
+        assert result['acknowledged']==1, result
     storage=TelemetryStorage(database);assert storage.load_samples()==[original];storage.close()
     assert pending(path)==[]
 
@@ -94,8 +113,9 @@ def test_bounded_overflow_report_survives_restart_and_is_acknowledged(tmp_path,f
     with socket.socket() as listener:
         listener.bind(('127.0.0.1',0));listener.listen();listener.settimeout(5)
         worker=receiver(database,listener)
-        assert run(flight_service,path,listener.getsockname()[1],0,boot=202,capacity=4)['acknowledged']==4
-        worker.join(5)
+        result=run(flight_service,path,listener.getsockname()[1],0,boot=202,capacity=4,recover=True)
+        join_receiver(worker)
+        assert result['acknowledged']==4, result
     with sqlite3.connect(database) as db:
         assert db.execute('SELECT lost_count,reason FROM loss_reports').fetchall()==[('0000000000000002',1)]
         assert db.execute("SELECT COUNT(*) FROM event_details WHERE event_type='telemetry_loss'").fetchone()[0]==1
@@ -105,7 +125,7 @@ def test_bounded_overflow_report_survives_restart_and_is_acknowledged(tmp_path,f
 def test_lost_loss_ack_retries_immutable_report_without_duplicate(tmp_path,flight_service):
     path=tmp_path/'outbox.db';database=tmp_path/'ground.db'
     run(flight_service,path,unused_port(),20,capacity=3)
-    stop=threading.Event();errors=[];lost=[]
+    stop=threading.Event();ready=threading.Event();errors=[];lost=[]
     listener=socket.socket();listener.bind(('127.0.0.1',0));listener.listen();listener.settimeout(.1)
 
     class LoseFirstLossAck:
@@ -119,8 +139,10 @@ def test_lost_loss_ack_retries_immutable_report_without_duplicate(tmp_path,fligh
             self.connection.sendall(frame)
 
     def work():
-        storage=TelemetryStorage(database)
+        storage=None
         try:
+            storage=TelemetryStorage(database)
+            ready.set()
             while not stop.is_set():
                 try:connection,_=listener.accept()
                 except TimeoutError:continue
@@ -130,11 +152,15 @@ def test_lost_loss_ack_retries_immutable_report_without_duplicate(tmp_path,fligh
                     try:GroundReceiver(storage).handle_connection(LoseFirstLossAck(connection))
                     except ConnectionResetError:pass
         except BaseException as error:errors.append(error)
-        finally:storage.close()
+        finally:
+            ready.set()
+            if storage is not None:storage.close()
     worker=threading.Thread(target=work);worker.start()
     try:
-        result=run(flight_service,path,listener.getsockname()[1],2,boot=202,capacity=100)
-        assert result['retained']==0
+        assert ready.wait(5), "ground storage did not become ready"
+        assert not errors, errors
+        result=run(flight_service,path,listener.getsockname()[1],2,boot=202,capacity=100,recover=True)
+        assert result['retained']==0, result
     finally:
         stop.set();listener.close();worker.join(3)
     assert lost and not errors and not worker.is_alive()

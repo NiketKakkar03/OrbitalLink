@@ -291,3 +291,25 @@ An identical duplicate receives the same ACK without another loss event.
 Type 8 is a 20-byte loss ACK: spacecraft ID (u32), boot ID/report ID (u64).
 Flight deletes only a matching durable loss record after this ACK. Lost ACKs cause
 retransmission; loss-report receipt never counts as telemetry sample receipt.
+
+## Multisensor telemetry (type 9)
+
+Type 9 retains the version-1 envelope and uses a 76-byte payload. Offsets below
+are relative to its payload: spacecraft u32 at 0, boot u64 at 4, telemetry
+sequence u64 at 12, generation u32 at 20, device sequence u32 at 24, monotonic
+nanoseconds u64 at 28, category u16 at 36, schema u16 at 38, quality u32 at 40,
+and eight signed big-endian i32 slots at 44. Schema must be 1, quality uses only
+bit 0 (sensor fault), category must be 1–6, unused slots are zero, and boolean
+slots are exactly 0 or 1. Category-specific slots and units are specified in
+[sensor-contract.md](sensor-contract.md). Events require code 1–8, severity 0–2,
+related category 1–6, and a positive repeat count.
+
+Legacy type 1 bytes and ACK type 2 identity remain unchanged. The shared
+[sensor fixture](fixtures/sensor_sample_v1.json) includes signed current and
+maximum uint64 boot/time values. Thermal battery temperature and power voltage
+populate the compatibility fields on decode; other compatibility fields are zero.
+Ground stores category/schema/quality and all signed slots in the same committed
+row as the identity before sending an ACK. Opening an older database adds default
+legacy metadata without rewriting its unsigned hexadecimal identities. Ground
+status reports category totals when multisensor records exist; tail/export include
+category names and exact slots, including health counters and bounded events.

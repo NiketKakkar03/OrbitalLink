@@ -18,7 +18,7 @@ from typing import Protocol
 from ground.orbit_protocol import (
     FrameParser,
     ProtocolError,
-    TELEMETRY_SAMPLE,
+    TELEMETRY_SAMPLE, SENSOR_SAMPLE, CATEGORY_NAMES,
     COMMAND_SESSION, COMMAND_RESULT, STATE_SNAPSHOT, LOSS_REPORT, LossReport, encode_loss_ack, ControlMessage,
     TelemetryAck,
     TelemetrySample,
@@ -39,6 +39,15 @@ class SampleStorage(Protocol):
 
 def classify_physical_validity(sample: TelemetrySample) -> tuple[bool, str | None]:
     """Classify plausible sensor values without confusing them with corrupt frames."""
+    if sample.category:
+        reasons = []
+        if sample.quality & 1:
+            reasons.append("sensor_fault")
+        if sample.category == 1 and (not 0 <= sample.values[0] <= 6000 or not 0 <= sample.values[2] <= 1000):
+            reasons.append("power_out_of_range")
+        if sample.category == 2 and any(not -100000 <= value <= 150000 for value in sample.values[:2]):
+            reasons.append("temperature_out_of_range")
+        return not reasons, ",".join(reasons) or None
     reasons: list[str] = []
     if not -100_000 <= sample.temperature_millideg_c <= 150_000:
         reasons.append("temperature_out_of_range")
@@ -92,7 +101,7 @@ class GroundReceiver:
                         from ground.orbit_commands import STATUS_NAMES
                         self._storage.record_command_result(command_id=identifier,command_session_id=session,command_sequence=sequence,status=STATUS_NAMES[status])
                     continue
-                if header.message_type != TELEMETRY_SAMPLE or not isinstance(message, TelemetrySample):
+                if header.message_type not in (TELEMETRY_SAMPLE, SENSOR_SAMPLE) or not isinstance(message, TelemetrySample):
                     raise ProtocolError("ground receiver expected telemetry sample")
 
                 # store_sample returns only after its transaction commits.  A
@@ -217,18 +226,21 @@ def main() -> int:
         try:
             if arguments.status:
                 print(f"telemetry_samples={storage.count_samples()}")
+                counts = storage.category_counts()
+                if any(name != "legacy" for name in counts):
+                    print("categories=" + json.dumps(counts, sort_keys=True))
                 return 0
             records = storage.load_records()
             if arguments.tail is not None:
                 if arguments.tail < 1:
                     parser.error("--tail COUNT must be positive")
                 for record in records[-arguments.tail :]:
-                    print(json.dumps(asdict(record), sort_keys=True))
+                    print(json.dumps({**asdict(record), "category_name": CATEGORY_NAMES[record.sample.category]}, sort_keys=True))
                 return 0
             assert arguments.export is not None
             with arguments.export.open("w") as output:
                 for record in records:
-                    output.write(json.dumps(asdict(record), sort_keys=True) + "\n")
+                    output.write(json.dumps({**asdict(record), "category_name": CATEGORY_NAMES[record.sample.category]}, sort_keys=True) + "\n")
             print(f"exported={len(records)} path={arguments.export}")
             return 0
         finally:

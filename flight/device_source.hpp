@@ -4,6 +4,11 @@
 #else
 #include <orbit_telemetry.h>
 #endif
+#if __has_include("../driver/include/orbit_sensors.h")
+#include "../driver/include/orbit_sensors.h"
+#else
+#include <orbit_sensors.h>
+#endif
 #include "orbit_protocol.hpp"
 #include <algorithm>
 #include <cerrno>
@@ -29,12 +34,14 @@ public:
     virtual std::ptrdiff_t read_records(void* destination,std::size_t bytes)=0;
     virtual orbit_stats stats()=0;
     virtual bool set_rate(const orbit_rate& rate)=0;
+    virtual orbit_sensor_clock clock_info(bool current=false) {(void)current;return {};}
 };
 #ifdef __linux__
 class LinuxDeviceIo final:public DeviceIo {
     int fd_{-1};
+    bool sensors_{};
 public:
-    explicit LinuxDeviceIo(const std::string& path) {
+    explicit LinuxDeviceIo(const std::string& path,bool sensors=false):sensors_(sensors) {
         fd_=::open(path.c_str(),O_RDONLY|O_NONBLOCK|O_CLOEXEC);
         if(fd_<0)throw std::runtime_error("cannot open telemetry device: "+path);
         struct stat metadata{};
@@ -61,11 +68,17 @@ public:
     }
     orbit_stats stats() override {
         orbit_stats result{};
-        if(::ioctl(fd_,ORBIT_IOC_GET_STATS,&result)!=0)throw std::runtime_error("telemetry GET_STATS failed");
+        if(::ioctl(fd_,sensors_?ORBIT_SENSOR_GET_STATS:ORBIT_IOC_GET_STATS,&result)!=0)throw std::runtime_error("telemetry GET_STATS failed");
+        return result;
+    }
+    orbit_sensor_clock clock_info(bool current=false) override {
+        orbit_sensor_clock result{};
+        if(!sensors_ || ::ioctl(fd_,current?ORBIT_SENSOR_CLOCK_CURRENT:ORBIT_SENSOR_GET_CLOCK,&result)!=0)
+            throw std::runtime_error("sensor clock calibration query failed");
         return result;
     }
     bool set_rate(const orbit_rate& rate) override {
-        return ::ioctl(fd_,ORBIT_IOC_SET_RATE,&rate)==0;
+        return ::ioctl(fd_,sensors_?ORBIT_SENSOR_SET_RATE:ORBIT_IOC_SET_RATE,&rate)==0;
     }
 };
 #endif
@@ -113,6 +126,54 @@ public:
     }
     static TelemetrySample telemetry(const orbit_sample& record,std::uint64_t boot,std::uint64_t sequence) {
         return {1,boot,sequence,record.device_generation,record.device_sequence,record.monotonic_ns,record.temperature_mc,record.voltage_mv};
+    }
+};
+inline std::unique_ptr<DeviceIo> open_sensor_device(const std::string& path) {
+#ifdef __linux__
+    return std::make_unique<LinuxDeviceIo>(path,true);
+#else
+    (void)path;throw std::invalid_argument("sensor MMIO driver requires Linux");
+#endif
+}
+class SensorSource {
+    std::unique_ptr<DeviceIo> io_;
+public:
+    orbit_sensor_clock clock_info(bool current=false) {return io_->clock_info(current);}
+    explicit SensorSource(std::unique_ptr<DeviceIo> io):io_(std::move(io)) {
+        if(!io_)throw std::invalid_argument("missing sensor IO backend");
+        (void)stats();
+    }
+    orbit_stats stats() {
+        auto s=io_->stats();
+        if(s.abi_version!=2 || s.dead || s.capacity!=ORBIT_SENSOR_FIFO_CAPACITY+64 || s.queued>s.capacity ||
+           s.generated<s.enqueued || s.generated-s.enqueued!=s.dropped ||
+           s.enqueued<s.delivered || s.enqueued-s.delivered!=s.queued)
+            throw std::runtime_error("invalid multisensor driver statistics");
+        return s;
+    }
+    bool set_rate(std::uint32_t ms) {
+        if(ms<1 || ms>60000)return false;
+        return io_->set_rate({2,ms,{0,0}});
+    }
+    std::vector<orbit_sensor_sample> read(std::size_t maximum) {
+        if(!maximum || !io_->ready(25))return {};
+        orbit_sensor_sample records[16]{};maximum=std::min<std::size_t>(maximum,16);
+        const auto bytes=io_->read_records(records,maximum*sizeof(records[0]));
+        if(bytes<0)return {};
+        if(!bytes || static_cast<std::size_t>(bytes)>maximum*sizeof(records[0]) || bytes%sizeof(records[0]))
+            throw std::runtime_error("incomplete multisensor driver record");
+        std::vector<orbit_sensor_sample> result(records,records+bytes/sizeof(records[0]));
+        for(const auto& r:result) {if(r.abi_version!=2)throw std::runtime_error("sensor ABI mismatch");(void)telemetry(r,1,1);}
+        return result;
+    }
+    static TelemetrySample telemetry(const orbit_sensor_sample& r,std::uint64_t boot,std::uint64_t sequence) {
+        if(r.category<1 || r.category>6 || r.schema>UINT16_MAX)throw std::runtime_error("sensor category/schema overflow");
+        TelemetrySample sample{1,boot,sequence,r.generation,r.sequence,r.monotonic_ns,0,0};
+        sample.category=static_cast<std::uint16_t>(r.category);sample.schema=static_cast<std::uint16_t>(r.schema);sample.quality=r.quality;
+        for(std::size_t i=0;i<8;++i)sample.values[i]=r.values[i];
+        if(sample.category==1 && sample.values[0]>=0)sample.voltage_millivolts=static_cast<std::uint32_t>(sample.values[0]);
+        if(sample.category==2)sample.temperature_millideg_c=sample.values[0];
+        validate_sensor(sample);return sample;
     }
 };
 } // namespace orbit

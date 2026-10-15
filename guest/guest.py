@@ -25,9 +25,10 @@ def digest(path):
         return hashlib.file_digest(stream, 'sha256').hexdigest()
 
 
-def command(out, state=None):
+def command(out, state=None, seed=1):
     state = state or out.parent / 'state.ext4'
     return [out / 'host/bin/qemu-system-aarch64', '-M', VERSIONS['qemu']['machine'],
+            '-global', f'orbit-sensor-hub.seed={seed}',
             '-cpu', 'cortex-a57', '-accel', 'tcg', '-m', '512', '-smp', '2',
             '-nographic', '-no-reboot', '-kernel', out / 'images/Image',
             '-append', 'root=/dev/vda rw console=ttyAMA0',
@@ -106,6 +107,11 @@ def build(work, jobs):
     if doctor():
         raise RuntimeError('Guest builds require Linux with the listed tools. See docs/guest.md.')
     src, out, args = configure(work)
+    # Existing cached QEMU packages must notice local device/scenario edits.
+    qemu_source = out / 'build' / ('host-qemu-' + VERSIONS['qemu']['version'])
+    if qemu_source.exists():
+        run([sys.executable, REPO / 'qemu/apply.py', qemu_source])
+        run(args + [f'BR2_JLEVEL={jobs}', 'host-qemu-rebuild'])
     # Recopy local sources on repeated builds; cached Buildroot local packages do
     # not otherwise notice edits to flight/*.cpp or headers.
     if list((out / 'build').glob('orbit-flight-*')):
@@ -131,6 +137,10 @@ def build(work, jobs):
     if 'AArch64' not in manifest['flight_elf_header']:
         raise RuntimeError('flight executable is not AArch64')
     manifest['flight_executable_sha256'] = digest(executable)
+    manifest['custom_qemu_sha256'] = {str(p.relative_to(REPO)): digest(p)
+        for directory in [REPO / 'qemu', REPO / 'simulation']
+        for p in sorted(directory.rglob('*')) if p.is_file() and '__pycache__' not in p.parts}
+    manifest['qemu_executable_sha256'] = digest(out / 'host/bin/qemu-system-aarch64')
     modules = sorted((out / 'target/lib/modules').rglob('orbit_test.ko'))
     if modules:
         manifest['driver_sha256'] = {str(p.relative_to(REPO)): digest(p)
@@ -144,9 +154,9 @@ def build(work, jobs):
     print('Built image manifest:', out / 'images/orbit-manifest.json')
 
 
-def boot(work, dry_run):
+def boot(work, dry_run, seed=1):
     out = work / 'output'
-    args = command(out)
+    args = command(out, seed=seed)
     if dry_run:
         print(json.dumps(list(map(str, args)), indent=2))
         return
@@ -170,7 +180,7 @@ def main():
     sub.add_parser('fetch')
     sub.add_parser('configure')
     p = sub.add_parser('build'); p.add_argument('--jobs', type=int, default=2)
-    p = sub.add_parser('run'); p.add_argument('--dry-run', action='store_true')
+    p = sub.add_parser('run'); p.add_argument('--dry-run', action='store_true'); p.add_argument('--seed', type=int, default=1)
     args = parser.parse_args()
     work = args.work.expanduser().resolve()
     if any(ch.isspace() for ch in str(work) + str(ROOT)):
@@ -186,7 +196,9 @@ def main():
             parser.error('--jobs must be positive')
         build(work, args.jobs)
     elif args.action == 'run':
-        boot(work, args.dry_run)
+        if not 0 <= args.seed <= 0xffffffff:
+            parser.error('--seed must fit uint32')
+        boot(work, args.dry_run, args.seed)
     return 0
 
 

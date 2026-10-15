@@ -6,7 +6,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from ground.orbit_protocol import TelemetrySample, LossReport, validate_loss
+from ground.orbit_protocol import TelemetrySample, LossReport, validate_loss, validate_sensor, CATEGORY_NAMES
 
 
 _UINT32_MAX = (1 << 32) - 1
@@ -45,6 +45,7 @@ def _validate_sample(sample: TelemetrySample) -> None:
     if not isinstance(sample, TelemetrySample):
         raise TypeError("sample must be a TelemetrySample")
 
+    validate_sensor(sample)
     _validate_integer("spacecraft_id", sample.spacecraft_id, 0, _UINT32_MAX)
     _validate_integer("flight_boot_id", sample.flight_boot_id, 0, _UINT64_MAX)
     _validate_integer("telemetry_sequence", sample.telemetry_sequence, 0, _UINT64_MAX)
@@ -94,6 +95,10 @@ class TelemetryStorage:
             )
             """
         )
+        columns = {row[1] for row in self.connection.execute("PRAGMA table_info(telemetry_samples)")}
+        for name, declaration in (("category", "INTEGER NOT NULL DEFAULT 0"), ("schema", "INTEGER NOT NULL DEFAULT 1"), ("quality", "INTEGER NOT NULL DEFAULT 0"), ("sensor_values", "TEXT NOT NULL DEFAULT '[0,0,0,0,0,0,0,0]'")):
+            if name not in columns:
+                self.connection.execute(f'ALTER TABLE telemetry_samples ADD COLUMN {name} {declaration}')
         self.connection.execute(
             f"""
             CREATE TABLE IF NOT EXISTS event_details (
@@ -182,9 +187,9 @@ class TelemetryStorage:
                     voltage_millivolts,
                     received_at_unix_ns,
                     physically_valid,
-                    validity_reason
+                    validity_reason, category, schema, quality, sensor_values
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (spacecraft_id, flight_boot_id, telemetry_sequence)
                 DO NOTHING
                 """,
@@ -199,7 +204,7 @@ class TelemetryStorage:
                     sample.voltage_millivolts,
                     _encode_uint64(received_at_unix_ns),
                     int(physically_valid),
-                    validity_reason,
+                    validity_reason, sample.category, sample.schema, sample.quality, json.dumps(sample.values),
                 ),
             )
             inserted = cursor.rowcount == 1
@@ -221,7 +226,7 @@ class TelemetryStorage:
                 device_sequence,
                 timestamp_monotonic_ns,
                 temperature_millideg_c,
-                voltage_millivolts
+                voltage_millivolts, category, schema, quality, sensor_values
             FROM telemetry_samples
             ORDER BY telemetry_sequence
             """
@@ -236,7 +241,7 @@ class TelemetryStorage:
                 device_sequence=row[4],
                 timestamp_monotonic_ns=_decode_uint64(row[5]),
                 temperature_millideg_c=row[6],
-                voltage_millivolts=row[7],
+                voltage_millivolts=row[7], category=row[8], schema=row[9], quality=row[10], values=tuple(json.loads(row[11])),
             )
             for row in cursor.fetchall()
         ]
@@ -250,7 +255,7 @@ class TelemetryStorage:
                 spacecraft_id, flight_boot_id, telemetry_sequence,
                 device_generation, device_sequence, timestamp_monotonic_ns,
                 temperature_millideg_c, voltage_millivolts,
-                received_at_unix_ns, physically_valid, validity_reason
+                received_at_unix_ns, physically_valid, validity_reason, category, schema, quality, sensor_values
             FROM telemetry_samples
             ORDER BY telemetry_sequence
         """
@@ -269,7 +274,7 @@ class TelemetryStorage:
                     device_sequence=row[4],
                     timestamp_monotonic_ns=_decode_uint64(row[5]),
                     temperature_millideg_c=row[6],
-                    voltage_millivolts=row[7],
+                    voltage_millivolts=row[7], category=row[11], schema=row[12], quality=row[13], values=tuple(json.loads(row[14])),
                 ),
                 received_at_unix_ns=_decode_uint64(row[8]),
                 physically_valid=bool(row[9]),
@@ -282,6 +287,9 @@ class TelemetryStorage:
         return self.connection.execute(
             "SELECT COUNT(*) FROM telemetry_samples"
         ).fetchone()[0]
+
+    def category_counts(self) -> dict[str, int]:
+        return {CATEGORY_NAMES[row[0]]: row[1] for row in self.connection.execute("SELECT category,COUNT(*) FROM telemetry_samples GROUP BY category")}
 
     def record_event(
         self, event_type: str, details: str, *, received_at_unix_ns: int | None = None

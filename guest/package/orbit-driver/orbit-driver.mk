@@ -7,6 +7,9 @@ define ORBIT_DRIVER_BUILD_CMDS
 	$(TARGET_MAKE_ENV) $(TARGET_CC) $(TARGET_CPPFLAGS) $(TARGET_CFLAGS) \
 		-std=c11 -Wall -Wextra -Werror -I$(@D) \
 		$(@D)/tests/syscall_contract.c -o $(@D)/orbit-syscall-contract
+	$(TARGET_MAKE_ENV) $(TARGET_CC) $(TARGET_CPPFLAGS) $(TARGET_CFLAGS) \
+		-std=c11 -Wall -Wextra -Werror -I$(@D) \
+		$(@D)/tests/sensors_contract.c -o $(@D)/orbit-sensors-contract
 endef
 
 define ORBIT_DRIVER_INSTALL_TARGET_CMDS
@@ -14,6 +17,8 @@ define ORBIT_DRIVER_INSTALL_TARGET_CMDS
 		$(TARGET_DIR)/usr/bin/orbit-syscall-contract
 	$(INSTALL) -D -m 0755 $(@D)/tests/run_guest_tests.sh \
 		$(TARGET_DIR)/usr/bin/orbit-driver-tests
+	$(INSTALL) -D -m 0755 $(@D)/orbit-sensors-contract \
+		$(TARGET_DIR)/usr/bin/orbit-sensors-contract
 endef
 
 $(eval $(kernel-module))

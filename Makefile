@@ -2,12 +2,16 @@ CXX ?= c++
 CXXFLAGS ?= -std=c++20 -Wall -Wextra -Werror
 OPENSSL_PREFIX ?= $(shell if [ -d /opt/homebrew/opt/openssl@3 ]; then printf /opt/homebrew/opt/openssl@3; elif [ -d /usr/local/opt/openssl@3 ]; then printf /usr/local/opt/openssl@3; fi)
 TLS_CXXFLAGS = $(if $(OPENSSL_PREFIX),-I$(OPENSSL_PREFIX)/include)
-TLS_LDLIBS = $(if $(OPENSSL_PREFIX),-L$(OPENSSL_PREFIX)/lib) -lssl -lcrypto
+TLS_LDLIBS = $(if $(OPENSSL_PREFIX),-L$(OPENSSL_PREFIX)/lib) -lssl -lcrypto -lsqlite3
 PYTHON ?= $(shell if [ -x .venv/bin/python ]; then printf '.venv/bin/python'; else printf 'python3'; fi)
 
 .PHONY: check test-python test-cpp test-native-e2e test-recovery test-security test-sanitizers test-tsan clean
 
-check: test-python test-cpp test-native-e2e test-recovery test-security test-harness
+check: test-python test-cpp test-native-e2e test-recovery test-durable test-security test-harness
+
+.PHONY: test-durable
+test-durable:
+	$(PYTHON) -m pytest ground/test_durable_e2e.py
 
 test-security:
 	$(PYTHON) -m pytest ground/test_security_e2e.py ground/test_command_e2e.py
@@ -19,7 +23,7 @@ test-security-sanitizers:
 test-python:
 	$(PYTHON) -m json.tool protocol/fixtures/telemetry_sample_v1.json >/dev/null
 	$(PYTHON) -m json.tool protocol/fixtures/telemetry_ack_v1.json >/dev/null
-	$(PYTHON) -m pytest ground/test_temperature.py ground/test_protocol.py ground/test_storage.py ground/test_command_broker.py ground/test_command_cli.py
+	$(PYTHON) -m pytest ground/test_temperature.py ground/test_protocol.py ground/test_storage.py ground/test_command_broker.py ground/test_command_cli.py ground/test_observability.py
 
 test-native-e2e:
 	$(PYTHON) -m pytest ground/test_native_e2e.py
@@ -28,6 +32,8 @@ test-recovery:
 	$(PYTHON) -m pytest ground/test_m3_e2e.py
 
 test-cpp:
+	$(CXX) $(CXXFLAGS) -pthread flight/durable_outbox_tests.cpp flight/durable_outbox.cpp -o /tmp/orbit_durable_outbox_test -lsqlite3
+	/tmp/orbit_durable_outbox_test
 	$(CXX) $(CXXFLAGS) -pthread flight/tests/test_command_policy.cpp -o /tmp/orbit_command_policy_test
 	/tmp/orbit_command_policy_test
 	$(CXX) $(CXXFLAGS) flight/tests/test_temperature.cpp -o /tmp/orbit_temperature_test
@@ -37,9 +43,11 @@ test-cpp:
 	$(CXX) $(CXXFLAGS) -pthread flight/tests/test_m3_policy.cpp -o /tmp/orbit_m3_policy_test
 	/tmp/orbit_m3_policy_test
 	$(CXX) $(CXXFLAGS) flight/send_sample.cpp -o /tmp/orbit_send_sample
-	$(CXX) $(CXXFLAGS) $(TLS_CXXFLAGS) -pthread flight/flight_service.cpp -o /tmp/orbit_flight_service $(TLS_LDLIBS)
+	$(CXX) $(CXXFLAGS) $(TLS_CXXFLAGS) -pthread flight/flight_service.cpp flight/durable_outbox.cpp -o /tmp/orbit_flight_service $(TLS_LDLIBS)
 
 test-sanitizers:
+	$(CXX) $(CXXFLAGS) -pthread -fsanitize=address,undefined flight/durable_outbox_tests.cpp flight/durable_outbox.cpp -o /tmp/orbit_durable_outbox_sanitized -lsqlite3
+	/tmp/orbit_durable_outbox_sanitized
 	$(CXX) $(CXXFLAGS) -pthread -fsanitize=address,undefined \
 		flight/tests/test_command_policy.cpp -o /tmp/orbit_command_policy_sanitized
 	/tmp/orbit_command_policy_sanitized
@@ -47,11 +55,13 @@ test-sanitizers:
 		flight/tests/test_m3_policy.cpp -o /tmp/orbit_m3_policy_sanitized
 	/tmp/orbit_m3_policy_sanitized
 	$(CXX) $(CXXFLAGS) -pthread -fsanitize=address,undefined \
-		-DORBIT_TEST_PLAINTEXT flight/flight_service.cpp -o /tmp/orbit_flight_service_sanitized
+		-DORBIT_TEST_PLAINTEXT flight/flight_service.cpp flight/durable_outbox.cpp -o /tmp/orbit_flight_service_sanitized -lsqlite3
 	/tmp/orbit_flight_service_sanitized 127.0.0.1 1 --count 10000 \
 		--interval-ms 0 --capacity 32 --connect-timeout-ms 10 --io-timeout-ms 10 --drain-ms 25
 
 test-tsan:
+	$(CXX) $(CXXFLAGS) -pthread -fsanitize=thread flight/durable_outbox_tests.cpp flight/durable_outbox.cpp -o /tmp/orbit_durable_outbox_tsan -lsqlite3
+	/tmp/orbit_durable_outbox_tsan
 	$(CXX) $(CXXFLAGS) -pthread -fsanitize=thread \
 		flight/tests/test_command_policy.cpp -o /tmp/orbit_command_policy_tsan
 	/tmp/orbit_command_policy_tsan
@@ -59,7 +69,7 @@ test-tsan:
 		flight/tests/test_m3_policy.cpp -o /tmp/orbit_m3_policy_tsan
 	/tmp/orbit_m3_policy_tsan
 	$(CXX) $(CXXFLAGS) -pthread -fsanitize=thread \
-		-DORBIT_TEST_PLAINTEXT flight/flight_service.cpp -o /tmp/orbit_flight_service_tsan
+		-DORBIT_TEST_PLAINTEXT flight/flight_service.cpp flight/durable_outbox.cpp -o /tmp/orbit_flight_service_tsan -lsqlite3
 	/tmp/orbit_flight_service_tsan 127.0.0.1 1 --count 10000 \
 		--interval-ms 0 --capacity 32 --connect-timeout-ms 10 --io-timeout-ms 10 --drain-ms 25
 

@@ -12,7 +12,7 @@ jobs:
         with:
           python-version: '3.12'
       - if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libssl-dev openssl
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev libsqlite3-dev openssl
       - if: runner.os == 'macOS'
         run: |
           brew install openssl@3

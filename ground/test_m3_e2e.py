@@ -39,6 +39,8 @@ def flight_service(tmp_path_factory: pytest.TempPathFactory) -> Path:
             "-Wextra",
             "-Werror",
             str(source),
+            str(PROJECT_ROOT / "flight" / "durable_outbox.cpp"),
+            "-lsqlite3",
             "-o",
             str(output),
         ],

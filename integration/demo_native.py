@@ -45,6 +45,7 @@ def run_demo(flight: Path, output: Path, samples: int) -> dict:
                 raise RuntimeError("ground readiness deadline exceeded")
             time.sleep(0.02)
         command = [str(flight), "127.0.0.1", ready.read_text().strip(),
+                   "--outbox", str(output / "flight-outbox.db"),
                    "--count", str(samples), "--interval-ms", "0", "--capacity", str(samples),
                    "--drain-ms", "3000", "--ca", str(credentials / "ca.pem"),
                    "--cert", str(credentials / "flight.pem"), "--key", str(credentials / "flight.key"),

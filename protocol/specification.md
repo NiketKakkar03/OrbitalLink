@@ -260,3 +260,29 @@ with `--argument` for set-period and `--ttl-ms` (1..5000). Start ground with
 (mode 0700). The socket mode is 0600. Queue and input size are bounded. Existing
 paths are never replaced. A finite flight --count completes acquisition and exits
 after telemetry drain; use a suitably large count for an interactive session.
+
+## Durable losses and read-only state (native mitigation)
+
+Types 1–5 remain unchanged. Type 6 is a 64-byte correlated state snapshot,
+returned only for accepted opcode 6 (`query-state`, argument zero). Its network
+byte order fields are session/command sequence/command ID (u64), status/reserved/
+enabled/period_ms/generation/fault (u32), effects/monotonic_ns (u64).
+Status and reserved are zero; enabled and fault are boolean. Expired, unauthorized,
+or otherwise rejected queries receive ordinary type-5 results. Queries use the
+same session, deadline, authorization and replay gates but never increment device
+effects. A snapshot describes execution time, not future state; it resolves
+uncertainty by observation and never automatically replays an earlier command.
+
+Type 7 is a 48-byte loss report: spacecraft ID (u32), boot ID/report ID/first
+sequence/last sequence/count (u64), reason (u32). Reason 1 denotes exact retention
+loss within one boot: first is positive, last >= first, count is positive and no
+larger than the inclusive span. Reason 2 denotes an exact count whose per-boot
+range detail was omitted to keep metadata bounded: boot/first/last must be zero.
+Report IDs are positive and immutable after being selected for delivery. Ground
+identifies reports by (spacecraft, boot, report ID), rejects changed payloads
+under an existing identity, and commits both report and event before sending ACK.
+An identical duplicate receives the same ACK without another loss event.
+
+Type 8 is a 20-byte loss ACK: spacecraft ID (u32), boot ID/report ID (u64).
+Flight deletes only a matching durable loss record after this ACK. Lost ACKs cause
+retransmission; loss-report receipt never counts as telemetry sample receipt.

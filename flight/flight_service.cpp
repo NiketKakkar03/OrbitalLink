@@ -1,6 +1,7 @@
 #include "orbit_protocol.hpp"
 #include "gap_tracker.hpp"
 #include "retention_queue.hpp"
+#include "durable_outbox.hpp"
 #include "retry_policy.hpp"
 #include "command_policy.hpp"
 
@@ -58,10 +59,18 @@ const char* state_name(ConnectionState state) {
 struct Config {
     std::string ca, certificate, key, server_name, authorized_command_server;
     std::string host;
+    std::string outbox_path;
+    std::uint64_t outbox_bytes{64*1024*1024};
     std::uint16_t port{};
     std::uint64_t count{100};
     std::uint64_t interval_ms{100};
-    std::size_t capacity{1024};
+    std::size_t capacity{
+#ifdef ORBIT_TEST_PLAINTEXT
+        1024
+#else
+        std::numeric_limits<std::size_t>::max()
+#endif
+    };
     std::uint64_t connect_timeout_ms{500};
     std::uint64_t io_timeout_ms{500};
     std::uint64_t drain_ms{3000};
@@ -72,6 +81,7 @@ struct Config {
         return distribution(entropy);
     }()};
     bool fake_fault{};
+    bool explicit_boot_id{};
     int ready_fd{-1};
 };
 
@@ -91,7 +101,12 @@ struct Counters {
 };
 
 struct Shared {
-    explicit Shared(std::size_t capacity) : retained(capacity), gaps(16) {}
+    explicit Shared(const Config& config) : retained(config.capacity), gaps(16) {
+        if(!config.outbox_path.empty()) durable=std::make_unique<orbit::DurableOutbox>(config.outbox_path,config.outbox_bytes,config.capacity);
+    }
+    std::unique_ptr<orbit::DurableOutbox> durable;
+    std::atomic<bool> storage_failed{false};
+    orbit::RetentionQueueSnapshot retention_snapshot() const { return durable?durable->snapshot():retained.snapshot(); }
     orbit::RetentionQueue<orbit::TelemetrySample> retained;
     orbit::GapTracker gaps;
     std::atomic<bool> acquisition_done{false};
@@ -169,13 +184,15 @@ Config parse_args(int argc, char** argv) {
     for (int i = 3; i < argc; i += 2) {
         if (i + 1 >= argc) throw std::invalid_argument(std::string("missing value for ") + argv[i]);
         const std::string option = argv[i];
+        if (option == "--outbox") { config.outbox_path=argv[i+1]; continue; }
         if (option == "--authorized-command-server") { config.authorized_command_server=argv[i+1]; continue; }
         if (option == "--ca") { config.ca = argv[i + 1]; continue; }
         if (option == "--cert") { config.certificate = argv[i + 1]; continue; }
         if (option == "--key") { config.key = argv[i + 1]; continue; }
         if (option == "--server-name") { config.server_name = argv[i + 1]; continue; }
         const auto value = parse_u64(argv[i + 1], option.c_str());
-        if (option == "--fake-fault") config.fake_fault = value != 0;
+        if (option == "--outbox-bytes") config.outbox_bytes=value;
+        else if (option == "--fake-fault") config.fake_fault = value != 0;
         else if (option == "--count") config.count = value;
         else if (option == "--interval-ms") config.interval_ms = value;
         else if (option == "--capacity") config.capacity = static_cast<std::size_t>(value);
@@ -184,7 +201,7 @@ Config parse_args(int argc, char** argv) {
         else if (option == "--drain-ms") config.drain_ms = value;
         else if (option == "--max-frames-per-iteration")
             config.max_frames_per_iteration = static_cast<std::size_t>(value);
-        else if (option == "--boot-id") config.boot_id = value;
+        else if (option == "--boot-id") {config.boot_id = value;config.explicit_boot_id=true;}
         else if (option == "--ready-fd") {
             if (value > static_cast<std::uint64_t>(std::numeric_limits<int>::max()))
                 throw std::invalid_argument("ready-fd is too large");
@@ -199,6 +216,8 @@ Config parse_args(int argc, char** argv) {
         throw std::invalid_argument("network timeouts must be positive");
     config.drain_ms = std::min<std::uint64_t>(config.drain_ms, 3000);
 #ifndef ORBIT_TEST_PLAINTEXT
+    if (config.explicit_boot_id) throw std::invalid_argument("--boot-id is only allowed in the plaintext test fixture; durable production uses a fresh boot identity");
+    if (config.outbox_path.empty()) throw std::invalid_argument("TLS flight service requires --outbox PATH for durable retention");
     if (config.ca.empty() || config.certificate.empty() || config.key.empty() || config.server_name.empty())
         throw std::invalid_argument("TLS requires --ca --cert --key --server-name");
     const auto validation = std::unique_ptr<SSL_CTX, decltype(&SSL_CTX_free)>(SSL_CTX_new(TLS_client_method()), SSL_CTX_free);
@@ -239,10 +258,13 @@ void acquisition_loop(const Config& config, Shared& shared) {
         sample.timestamp_monotonic_ns=monotonic_ns();
         if(device.fault) sample.temperature_millideg_c=200000;
         shared.counters.generated.fetch_add(1);
-        const auto displaced = shared.retained.push(sample);
-        if (displaced) {
-            shared.counters.dropped_oldest.fetch_add(1);
-            shared.gaps.record_dropped(displaced->telemetry_sequence);
+        if(shared.durable) {
+            const auto displaced=shared.durable->push(sample);
+            shared.counters.dropped_oldest.fetch_add(displaced.size());
+            for(const auto& lost:displaced) shared.gaps.record_dropped(lost.telemetry_sequence);
+        } else {
+            const auto displaced=shared.retained.push(sample);
+            if(displaced) {shared.counters.dropped_oldest.fetch_add(1);shared.gaps.record_dropped(displaced->telemetry_sequence);}
         }
         next=Clock::now()+Milliseconds(device.period_ms);
     }
@@ -464,8 +486,8 @@ void network_loop(const Config& config, Shared& shared) {
                                     : config.drain_ms;
             drain_deadline = Clock::now() + Milliseconds(budget);
         }
-        const auto queue_snapshot = shared.retained.snapshot();
-        if (!in_flight && queue_snapshot.size == 0) {
+        const auto queue_snapshot = shared.retention_snapshot();
+        if (!in_flight && queue_snapshot.size == 0 && (!shared.durable || shared.durable->losses().empty())) {
             // Acquisition is the only producer. Do not close the queue until it
             // has explicitly finished: it may have passed its stop check and be
             // immediately about to perform its final push.
@@ -564,10 +586,39 @@ void network_loop(const Config& config, Shared& shared) {
             }
         }
 
+        if(shared.durable) {
+            if(auto loss=shared.durable->claim_loss()) {
+                orbit::LossReport report{1,loss->boot_id,loss->id,loss->first,loss->last,loss->count,loss->detail_complete?1U:2U};
+                auto deadline=Clock::now()+Milliseconds(config.io_timeout_ms);
+                if(drain_started) deadline=std::min(deadline,drain_deadline);
+                bool accepted=false;
+                try {
+                    if(send_bytes(socket,orbit::encode_loss_report(report),deadline)) {
+                        for(unsigned n=0;n<17;++n) {
+                            std::vector<std::uint8_t> bytes;
+                            if(!receive_frame(socket,bytes,deadline)) break;
+                            auto decoded=orbit::decode_frame(bytes);
+                            if(decoded.header.message_type==orbit::kCommandRequest) {
+                                if(!dispatch_command(socket,decoded,shared,command_authorized,deadline)) break;
+                                continue;
+                            }
+                            accepted=decoded.header.message_type==orbit::kLossAck && decoded.header.message_sequence==report.report_id && decoded.loss_ack.spacecraft_id==report.spacecraft_id && decoded.loss_ack.flight_boot_id==report.flight_boot_id && decoded.loss_ack.report_id==report.report_id;
+                            break;
+                        }
+                    }
+                } catch(const orbit::ProtocolError&) { accepted=false; }
+                if(!accepted) {
+                    socket.reset();shared.commands.close();shared.counters.reconnects.fetch_add(1);
+                    shared.state.store(ConnectionState::backoff);wait_backoff(retry.next_delay());continue;
+                }
+                shared.durable->acknowledge_loss(loss->id);retry.reset();
+            }
+        }
+
         std::size_t processed = 0;
         while (socket && processed < config.max_frames_per_iteration) {
             if (!in_flight) {
-                in_flight = shared.retained.try_pop();
+                in_flight = shared.durable?shared.durable->claim():shared.retained.try_pop();
             }
             if (!in_flight) break;
             const auto& sample = *in_flight;
@@ -604,6 +655,7 @@ void network_loop(const Config& config, Shared& shared) {
                 break;
             }
 
+            if(shared.durable) shared.durable->acknowledge(sample);
             shared.counters.acknowledged.fetch_add(1);
             retry.reset();
             in_flight.reset();
@@ -615,8 +667,8 @@ void network_loop(const Config& config, Shared& shared) {
 
     socket.reset(); shared.commands.close();
     shared.state.store(ConnectionState::stopping);
-    std::uint64_t discarded = in_flight ? 1 : 0;
-    discarded += shared.retained.discard(std::numeric_limits<std::size_t>::max());
+    std::uint64_t discarded = shared.durable?0:(in_flight ? 1 : 0);
+    if(!shared.durable) discarded += shared.retained.discard(std::numeric_limits<std::size_t>::max());
     shared.counters.discarded_shutdown.fetch_add(discarded);
     shared.retained.close();
     shared.drain_active.store(false);
@@ -624,7 +676,7 @@ void network_loop(const Config& config, Shared& shared) {
 
 void print_summary(const Shared& shared) {
     const auto& c = shared.counters;
-    const auto retained = shared.retained.snapshot();
+    const auto retained = shared.retention_snapshot();
     const auto gaps = shared.gaps.snapshot();
     const auto device = shared.commands.state();
     std::cout << "{\"state\":\"" << state_name(shared.state.load())
@@ -649,13 +701,26 @@ void print_summary(const Shared& shared) {
               << ",\"device_period_ms\":" << device.period_ms
               << ",\"device_generation\":" << device.generation
               << ",\"device_fault\":" << (device.fault ? "true" : "false")
+              << ",\"storage_failed\":" << (shared.storage_failed.load() ? "true" : "false")
+              << ",\"durable\":" << (shared.durable ? "true" : "false")
+              << ",\"retention_capacity\":" << retained.capacity
               << ",\"gap_ranges\":[";
     for (std::size_t index = 0; index < gaps.detailed_ranges.size(); ++index) {
         if (index != 0) std::cout << ',';
         std::cout << "[" << gaps.detailed_ranges[index].first << ','
                   << gaps.detailed_ranges[index].last << "]";
     }
-    std::cout << "],\"retained\":" << retained.size << "}\n";
+    std::cout << "],\"retained\":" << retained.size;
+    if (shared.durable) {
+        const auto totals = shared.durable->accounting();
+        std::cout << ",\"outbox_database_limit_bytes\":" << shared.durable->database_limit_bytes()
+                  << ",\"durable_generated\":" << totals.generated
+                  << ",\"durable_acknowledged\":" << totals.acknowledged
+                  << ",\"durable_dropped\":" << totals.dropped
+                  << ",\"durable_retained\":" << totals.retained
+                  << ",\"durable_loss_acknowledged\":" << totals.loss_acknowledged;
+    }
+    std::cout << "}\n";
 }
 
 }  // namespace
@@ -667,12 +732,19 @@ int main(int argc, char** argv) {
     ::signal(SIGPIPE, SIG_IGN);
     try {
         const auto config = parse_args(argc, argv);
-        Shared shared(config.capacity);
+        Shared shared(config);
         signal_stop = &shared.stop_requested;
         signal_drain = &shared.drain_active;
         if (early_stop_requested.load()) shared.stop_requested.store(true);
-        std::thread acquisition(acquisition_loop, std::cref(config), std::ref(shared));
-        std::thread network(network_loop, std::cref(config), std::ref(shared));
+        auto guarded=[&](auto loop) {
+            try { loop(config,shared); }
+            catch(const std::exception& error) {
+                std::cerr<<"flight_service: retention/network failure: "<<error.what()<<"\n";
+                shared.storage_failed.store(true);shared.stop_requested.store(true);shared.acquisition_done.store(true);
+            }
+        };
+        std::thread acquisition([&]{guarded(acquisition_loop);});
+        std::thread network([&]{guarded(network_loop);});
         if (config.ready_fd >= 0) {
             const char ready = 'R';
             (void)::write(config.ready_fd, &ready, 1);
@@ -683,7 +755,7 @@ int main(int argc, char** argv) {
         signal_stop = nullptr;
         signal_drain = nullptr;
         print_summary(shared);
-        return 0;
+        return shared.storage_failed.load()?2:0;
     } catch (const std::exception& error) {
         std::cerr << "flight_service: " << error.what() << '\n';
         return 2;

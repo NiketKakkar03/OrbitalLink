@@ -15,7 +15,7 @@ from ground.orbit_protocol import COMMAND_REQUEST, encode_control
 import struct
 
 STATUS_NAMES = ('applied', 'unauthorized', 'wrong_session', 'replay', 'expired', 'invalid_argument', 'queue_full', 'outcome_unknown')
-OPCODES = {'enable': 1, 'disable': 2, 'set-period': 3, 'reset': 4, 'clear-fault': 5}
+OPCODES = {'enable': 1, 'disable': 2, 'set-period': 3, 'reset': 4, 'clear-fault': 5, 'query-state': 6}
 
 class CommandBroker:
     def __init__(self):
@@ -44,7 +44,7 @@ class CommandBroker:
                 self.pending.get_nowait()
 
     def submit(self, opcode, argument=0, ttl_ms=1000, timeout=2):
-        if not all(type(value) is int for value in (opcode,argument,ttl_ms)) or opcode not in range(1,6) or (opcode == 3 and not 1 <= argument <= 60000) or (opcode != 3 and argument != 0) or not 1 <= ttl_ms <= 5000:
+        if not all(type(value) is int for value in (opcode,argument,ttl_ms)) or opcode not in range(1,7) or (opcode == 3 and not 1 <= argument <= 60000) or (opcode != 3 and argument != 0) or not 1 <= ttl_ms <= 5000:
             return {'status': 'invalid_argument'}
         with self.lock:
             if not self.session:
@@ -59,7 +59,7 @@ class CommandBroker:
             deadline = flight_now + time.monotonic_ns() - local_now + ttl_ms * 1000000
             if deadline >= 2**64:
                 return {'status':'invalid_argument'}
-            entry = {'id': identifier, 'sequence': self.sequence, 'session': session, 'event': threading.Event(), 'result': None}
+            entry = {'id': identifier, 'sequence': self.sequence, 'session': session, 'opcode': opcode, 'event': threading.Event(), 'result': None}
             self.waiters[identifier] = entry
             try:
                 self.pending.put_nowait((identifier, encode_control(COMMAND_REQUEST, struct.pack('!QQQQII', session, self.sequence, identifier, deadline, opcode, argument), self.sequence)))
@@ -91,6 +91,19 @@ class CommandBroker:
                 self.waiters.pop(identifier)
                 entry['result'] = {'status': STATUS_NAMES[status], 'id': identifier, 'sequence': sequence}
                 entry['event'].set()
+
+    def snapshot(self, payload):
+        if len(payload) != 64: raise ValueError('invalid state snapshot length')
+        session,sequence,identifier,status,reserved,enabled,period,generation,fault,effects,now = struct.unpack('!QQQIIIIIIQQ',payload)
+        if status or enabled not in (0,1) or fault not in (0,1) or reserved or not 0 <= period <= 60000:
+            raise ValueError('invalid state snapshot')
+        with self.lock:
+            entry=self.waiters.get(identifier)
+            if entry and entry['opcode']==6 and (session,sequence)==(entry['session'],entry['sequence']):
+                self.waiters.pop(identifier)
+                entry['result']={'status':'applied','id':identifier,'sequence':sequence,'state':{'enabled':bool(enabled),'period_ms':period,'generation':generation,'fault':bool(fault),'effects':effects,'monotonic_ns':now}}
+                entry['event'].set()
+
 
 class ControlSocket:
     def __init__(self, path, broker, stop):

@@ -16,8 +16,9 @@ constexpr std::uint8_t kVersion = 1;
 constexpr std::uint8_t kTelemetrySample = 1;
 constexpr std::uint8_t kTelemetryAck = 2;
 constexpr std::uint8_t kCommandSession = 3, kCommandRequest = 4, kCommandResult = 5;
+constexpr std::uint8_t kStateSnapshot=6, kLossReport=7, kLossAck=8;
 inline std::uint32_t payload_size(std::uint8_t type) {
-    switch(type) { case 1:return 44;case 2:return 20;case 3:return 24;case 4:return 40;case 5:return 32;default:throw std::runtime_error("unsupported message type"); }
+    switch(type) { case 1:return 44;case 2:return 20;case 3:return 24;case 4:return 40;case 5:return 32;case 6:return 64;case 7:return 48;case 8:return 20;default:throw std::runtime_error("unsupported message type"); }
 }
 constexpr std::uint16_t kHeaderLength = 28;
 constexpr std::uint32_t kMaxPayloadLength = 4096;
@@ -47,11 +48,16 @@ struct TelemetryAck {
     std::uint64_t telemetry_sequence{};
 };
 
+struct LossReport { std::uint32_t spacecraft_id{}; std::uint64_t flight_boot_id{}, report_id{}, first{}, last{}, count{}; std::uint32_t reason{1}; };
+struct LossAck { std::uint32_t spacecraft_id{}; std::uint64_t flight_boot_id{}, report_id{}; };
+
 struct DecodedFrame {
     Header header;
     TelemetrySample sample;
     TelemetryAck ack;
     CommandRequest command;
+    LossReport loss;
+    LossAck loss_ack;
 };
 
 class ProtocolError : public std::runtime_error {
@@ -154,15 +160,30 @@ inline std::vector<std::uint8_t> encode_telemetry_ack(const TelemetryAck& ack,
 }
 
 inline std::vector<std::uint8_t> encode_control(std::uint8_t type, const std::vector<std::uint8_t>& payload, std::uint64_t sequence=1) {
-    if (type < 3 || type > 5 || payload.size()!=payload_size(type)) throw ProtocolError("bad command frame");
+    if (type < 3 || type > 8 || payload.size()!=payload_size(type)) throw ProtocolError("bad command frame");
     std::vector<std::uint8_t> out(kMagic.begin(),kMagic.end());
     out.push_back(kVersion);out.push_back(type);append_u16(out,0);append_u16(out,kHeaderLength);append_u16(out,0);
     append_u32(out,payload.size());append_u64(out,sequence);append_u32(out,0);out.insert(out.end(),payload.begin(),payload.end());return out;
 }
 inline std::vector<std::uint8_t> encode_command_result(const CommandResult& result) {
     std::vector<std::uint8_t> out;append_u64(out,result.request.session);append_u64(out,result.request.sequence);
-    append_u64(out,result.request.id);append_u32(out,static_cast<std::uint32_t>(result.status));append_u32(out,0);
+    append_u64(out,result.request.id);append_u32(out,static_cast<std::uint32_t>(result.status));
+    if(result.snapshot) {
+        const auto& state=*result.snapshot;
+        append_u32(out,0);append_u32(out,state.enabled);append_u32(out,state.period_ms);append_u32(out,state.generation);
+        append_u32(out,state.fault);append_u64(out,state.effects);append_u64(out,result.monotonic_ns);
+        return encode_control(kStateSnapshot,out,result.request.sequence);
+    }
+    append_u32(out,0);
     return encode_control(kCommandResult,out,result.request.sequence);
+}
+
+inline std::vector<std::uint8_t> encode_loss_report(const LossReport& loss) {
+    if (!loss.report_id || !loss.count || (loss.reason==1 && (!loss.first || loss.last<loss.first || loss.count>loss.last-loss.first+1)) || (loss.reason==2 && (loss.flight_boot_id || loss.first || loss.last)) || (loss.reason!=1 && loss.reason!=2)) throw ProtocolError("invalid loss report");
+    std::vector<std::uint8_t> p;append_u32(p,loss.spacecraft_id);append_u64(p,loss.flight_boot_id);append_u64(p,loss.report_id);append_u64(p,loss.first);append_u64(p,loss.last);append_u64(p,loss.count);append_u32(p,loss.reason);return encode_control(kLossReport,p,loss.report_id);
+}
+inline std::vector<std::uint8_t> encode_loss_ack(const LossAck& ack) {
+    std::vector<std::uint8_t> p;append_u32(p,ack.spacecraft_id);append_u64(p,ack.flight_boot_id);append_u64(p,ack.report_id);return encode_control(kLossAck,p,ack.report_id);
 }
 
 inline DecodedFrame decode_frame(const std::vector<std::uint8_t>& frame) {
@@ -185,7 +206,7 @@ inline DecodedFrame decode_frame(const std::vector<std::uint8_t>& frame) {
     const auto message_sequence = read_u64(frame, 16);
     const auto reserved_b = read_u32(frame, 24);
 
-    if (message_type < kTelemetrySample || message_type > kCommandResult) {
+    if (message_type < kTelemetrySample || message_type > kLossAck) {
         throw ProtocolError("unsupported message type");
     }
     if (flags != 0) {
@@ -237,6 +258,12 @@ inline DecodedFrame decode_frame(const std::vector<std::uint8_t>& frame) {
         };
     }
     if (message_type == kCommandRequest) decoded.command = CommandRequest{read_u64(frame,28),read_u64(frame,36),read_u64(frame,44),read_u64(frame,52),read_u32(frame,60),read_u32(frame,64)};
+    if(message_type==kStateSnapshot && (read_u32(frame,52)!=0 || read_u32(frame,56)!=0 || read_u32(frame,60)>1 || read_u32(frame,64)>60000 || read_u32(frame,72)>1)) throw ProtocolError("invalid state snapshot");
+    if(message_type==kLossReport) {
+        decoded.loss={read_u32(frame,28),read_u64(frame,32),read_u64(frame,40),read_u64(frame,48),read_u64(frame,56),read_u64(frame,64),read_u32(frame,72)};
+        encode_loss_report(decoded.loss);
+    }
+    if(message_type==kLossAck) decoded.loss_ack={read_u32(frame,28),read_u64(frame,32),read_u64(frame,40)};
     return decoded;
 }
 
@@ -260,7 +287,7 @@ class FrameParser {
                 throw ProtocolError("unsupported version");
             }
             const auto message_type = buffer_.at(5);
-            if (message_type < kTelemetrySample || message_type > kCommandResult) {
+            if (message_type < kTelemetrySample || message_type > kLossAck) {
                 throw ProtocolError("unsupported message type");
             }
             if (read_u16(buffer_, 6) != 0) {

@@ -91,6 +91,7 @@ With the TLS receiver and disposable certificates described in
 ```bash
 make test-cpp
 /tmp/orbit_flight_service 127.0.0.1 9000 \
+  --outbox /tmp/orbit-flight-outbox.db \
   --ca /tmp/orbit-certificates/ca.pem \
   --cert /tmp/orbit-certificates/flight.pem \
   --key /tmp/orbit-certificates/flight.key \
@@ -100,14 +101,17 @@ make test-cpp
   --capacity 1024
 ```
 
-The default generation rate is 10 samples per second and the default backlog
-capacity is 1,024 samples. When the backlog is full, the oldest queued sample is
-dropped so recent telemetry is retained. The one partially or fully transmitted
-but unacknowledged frame is bounded separately and is never evicted midway.
+The default generation rate is 10 samples per second. Normal flight builds require
+a SQLite outbox and default to a 64 MiB total storage budget; `--outbox-bytes`
+changes that budget and `--capacity` adds an optional record-count limit.
+Old queued samples are dropped when retention fills, while an in-flight sample
+stays protected until its matching ACK. The memory-only regression fixture keeps
+its original 1,024 queued samples plus a separately bounded in-flight frame.
 
 Each service run generates a fresh random 64-bit boot identity so restarted
-sequence numbers remain distinct in SQLite. Use `--boot-id NUMBER` for explicit
-replay experiments. The small `send_sample` fixture tool deliberately retains a
+sequence numbers remain distinct in SQLite. Persisted samples replay with their
+original identities and payloads. Explicit boot-ID overrides are limited to the
+plaintext regression fixture. The small `send_sample` fixture tool retains a
 fixed identity for deterministic duplicate tests.
 
 The service prints one final JSON object containing counters such as:
@@ -118,21 +122,32 @@ connect_attempts, connect_failures, reconnects, transmission_attempts,
 retransmissions, queue_high_watermark, gap_ranges
 ```
 
-At shutdown, sample accounting must satisfy:
+The memory-only fixture accounts at shutdown as:
 
 ```text
 generated = acknowledged + dropped_oldest + discarded_shutdown
 ```
+
+Durable totals persist across runs and satisfy:
+
+```text
+durable_generated = durable_acknowledged + durable_dropped + durable_retained
+```
+
+Current-run ACKs may include samples recovered from earlier runs; use the durable
+totals to reconcile a restarted service. Storage failures produce an explicit
+failure exit and preserve whatever remains committed in the outbox.
 
 Overflow losses are also recorded in a separate bounded gap summary. Consecutive
 telemetry sequences coalesce into ranges. Up to 16 ranges retain details; after
 that, the summary keeps an exact omitted-loss count and marks its detailed report
 incomplete instead of allocating memory without a bound.
 
-In M3 this gap notice is emitted locally in the service's final JSON summary; it
-is not yet transported to ground as a new wire message. A live ground-bound gap
-message can be added with the later operational protocol without making the
-in-memory loss-reporting mechanism unbounded.
+Normal flight also persists bounded loss reports, retransmits immutable report
+identities, and removes them only after ground commits and ACKs them. Ground
+deduplicates reports and rejects conflicting payloads under an existing identity.
+When detailed ranges fill, bounded summaries preserve exact loss counts while
+marking the missing range detail. See [retention policy](docs/retention.md).
 
 Connection retries begin at 250 ms, double to a five-second cap, include bounded
 jitter, and reset after a successful ACK. Socket operations use nonblocking I/O
@@ -140,10 +155,10 @@ and deadlines. SIGINT or SIGTERM stops acquisition, attempts a bounded drain,
 accounts for every remaining sample, closes descriptors, and joins both threads
 within the three-second external shutdown contract.
 
-The flight backlog exists only in memory. A flight-process crash or restart can
-therefore lose unacknowledged samples. If ground remains unavailable indefinitely,
-the queue stays bounded, old samples are dropped with counters, and shutdown
-discards and accounts for whatever remains.
+Committed telemetry and loss reports survive a flight-process restart. An
+indefinite outage still exceeds finite storage: old queued samples are dropped
+with durable loss accounting. Disk corruption, hardware failure, or a filesystem
+that does not honor synchronization remain outside that guarantee.
 
 ## Embedded milestone gates
 

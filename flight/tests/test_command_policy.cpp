@@ -4,6 +4,25 @@
 #include <atomic>
 #include <thread>
 int main() {
+    {
+        orbit::LossReport report{1,2,3,4,7,4,1};
+        auto decoded=orbit::decode_frame(orbit::encode_loss_report(report));
+        assert(decoded.loss.report_id==3 && decoded.loss.count==4);
+        auto ack=orbit::decode_frame(orbit::encode_loss_ack({1,2,3}));
+        assert(ack.loss_ack.report_id==3);
+        orbit::CommandResult result{{42,1,100,1000,6,0},orbit::CommandStatus::applied,orbit::FakeDeviceState{},100};
+        auto snapshot=orbit::decode_frame(orbit::encode_command_result(result));
+        assert(snapshot.header.message_type==orbit::kStateSnapshot && snapshot.header.payload_length==64);
+    }
+
+    {
+        orbit::CommandDispatcher query; query.open(44);
+        assert(query.submit({44,1,8,1000,6,0},true,0)==orbit::CommandStatus::applied);
+        query.execute(10); auto result=query.pop_result();
+        assert(result && result->snapshot && result->monotonic_ns==10);
+        assert(result->snapshot->effects==0 && query.state().effects==0);
+    }
+
     orbit::CommandDispatcher dispatch;
     dispatch.open(42);
     orbit::CommandRequest request{42,1,100,1000,3,250};

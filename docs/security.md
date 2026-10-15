@@ -20,6 +20,7 @@ Generate disposable credentials (two-day lifetime) and run:
   --key /tmp/orbit-certificates/ground.key --allowed-client flight.orbital.test
 make test-cpp
 /tmp/orbit_flight_service 127.0.0.1 9000 --count 100 \
+  --outbox /tmp/orbit-flight-outbox.db \
   --ca /tmp/orbit-certificates/ca.pem --cert /tmp/orbit-certificates/flight.pem \
   --key /tmp/orbit-certificates/flight.key --server-name ground.orbital.test
 ```
@@ -59,19 +60,20 @@ created with mode 0600. Submit one local operator request:
 ```sh
 .venv/bin/python -m ground.orbit_commands --socket /path/to/private-directory/control.sock reset
 .venv/bin/python -m ground.orbit_commands --socket /path/to/private-directory/control.sock set-period --argument 50
+.venv/bin/python -m ground.orbit_commands --socket /path/to/private-directory/control.sock query-state
 ```
 
 Available operations are `enable`, `disable`, `set-period` (1–60000 milliseconds),
-`reset`, and `clear-fault`. Native operations change the deterministic fake-device
+`reset`, `clear-fault`, and the read-only `query-state`. Native operations change the deterministic fake-device
 state; they do not control hardware. Ground stores received completions in SQLite
 `command_results`. `applied` means acquisition performed the operation, while
 rejections have no device effect. A timeout or disconnect yields `outcome_unknown`:
 the effect may have occurred before its result was lost. Neither flight nor ground
 automatically replays an ambiguous request. Operators must inspect current state
-before deliberately submitting another command. Telemetry and SQLite establish
-observable sample state; the flight final summary exposes fake-device state and
-effect counts after shutdown. There is no live device-state query command. If
-current state cannot be established, keep the outcome unknown.
+before deliberately submitting another command. `query-state` reports enabled
+state, period, generation, fault state, effect count, and flight monotonic time.
+It requires the configured command role and adds no device effect. If connectivity
+prevents obtaining a snapshot, keep the outcome unknown.
 
 The native threat model protects telemetry and control from unauthenticated
 network peers, spoofed server identities, trusted but unauthorized roles, stale

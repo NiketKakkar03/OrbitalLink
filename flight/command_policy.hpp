@@ -13,8 +13,9 @@ enum class CommandStatus : std::uint32_t {
     applied=0, unauthorized=1, wrong_session=2, replay=3, expired=4,
     invalid_argument=5, queue_full=6, outcome_unknown=7
 };
-struct CommandResult { CommandRequest request; CommandStatus status; };
 struct FakeDeviceState { bool enabled{true}; std::uint32_t period_ms{100}, generation{7}; bool fault{}; std::uint64_t effects{}; };
+
+struct CommandResult { CommandRequest request; CommandStatus status; std::optional<FakeDeviceState> snapshot{}; std::uint64_t monotonic_ns{}; };
 
 // Acquisition alone executes device effects. Network owns session policy.
 // Both work and result queues are bounded; disconnect invalidates queued work.
@@ -35,7 +36,7 @@ class CommandDispatcher {
         if (request.session != session_ || !session_) return CommandStatus::wrong_session;
         if (!request.sequence || request.sequence <= last_sequence_) return CommandStatus::replay;
         if (request.deadline_ns <= now || request.deadline_ns-now > 5'000'000'000ULL) return CommandStatus::expired;
-        if (request.opcode < 1 || request.opcode > 5 ||
+        if (request.opcode < 1 || request.opcode > 6 ||
             (request.opcode == 3 ? (request.argument < 1 || request.argument > 60'000) : request.argument != 0))
             return CommandStatus::invalid_argument;
         if (work_.size()+results_.size() >= 16) return CommandStatus::queue_full;
@@ -58,8 +59,8 @@ class CommandDispatcher {
                 case 4: ++state_.generation; break;
                 case 5: state_.fault=false; break;
             }
-            if(status==CommandStatus::applied) ++state_.effects;
-            results_.push_back({request,status});
+            if(status==CommandStatus::applied && request.opcode != 6) ++state_.effects;
+            results_.push_back({request,status, request.opcode==6 && status==CommandStatus::applied ? std::optional<FakeDeviceState>(state_) : std::nullopt, now});
         }
     }
     std::optional<CommandResult> pop_result() {

@@ -12,6 +12,9 @@ TELEMETRY_ACK = 2
 COMMAND_SESSION = 3
 COMMAND_REQUEST = 4
 COMMAND_RESULT = 5
+STATE_SNAPSHOT = 6
+LOSS_REPORT = 7
+LOSS_ACK = 8
 TELEMETRY_SAMPLE_PAYLOAD_LENGTH = 44
 TELEMETRY_ACK_PAYLOAD_LENGTH = 20
 
@@ -51,12 +54,37 @@ class TelemetryAck:
 
 
 @dataclass(frozen=True)
+class LossReport:
+    spacecraft_id: int
+    flight_boot_id: int
+    report_id: int
+    first: int
+    last: int
+    count: int
+    reason: int = 1
+
+
+def validate_loss(loss):
+    if not loss.report_id or not loss.count or loss.reason not in (1,2) or (loss.reason == 1 and (not loss.first or loss.last < loss.first or loss.count > loss.last-loss.first+1)) or (loss.reason == 2 and (loss.flight_boot_id or loss.first or loss.last)):
+        raise ProtocolError("invalid loss report")
+
+
+def encode_loss_report(loss):
+    validate_loss(loss)
+    return encode_control(LOSS_REPORT, struct.pack('!IQQQQQI', loss.spacecraft_id, loss.flight_boot_id, loss.report_id, loss.first, loss.last, loss.count, loss.reason), loss.report_id)
+
+
+def encode_loss_ack(loss):
+    return encode_control(LOSS_ACK, struct.pack('!IQQ',loss.spacecraft_id,loss.flight_boot_id,loss.report_id),loss.report_id)
+
+
+@dataclass(frozen=True)
 class ControlMessage:
     payload: bytes
 
 
 def encode_control(kind: int, payload: bytes, message_sequence: int = 1) -> bytes:
-    expected = {COMMAND_SESSION: 24, COMMAND_REQUEST: 40, COMMAND_RESULT: 32}
+    expected = {COMMAND_SESSION: 24, COMMAND_REQUEST: 40, COMMAND_RESULT: 32, STATE_SNAPSHOT: 64, LOSS_REPORT: 48, LOSS_ACK: 20}
     if kind not in expected or len(payload) != expected[kind]:
         raise ProtocolError("bad command frame")
     return HEADER_STRUCT.pack(MAGIC, VERSION, kind, 0, HEADER_LENGTH, 0,
@@ -132,7 +160,7 @@ def decode_frame(frame: bytes) -> tuple[Header, TelemetrySample | TelemetryAck]:
         raise ProtocolError("bad magic")
     if version != VERSION:
         raise ProtocolError("unsupported version")
-    if message_type not in (TELEMETRY_SAMPLE, TELEMETRY_ACK, COMMAND_SESSION, COMMAND_REQUEST, COMMAND_RESULT):
+    if message_type not in (TELEMETRY_SAMPLE, TELEMETRY_ACK, COMMAND_SESSION, COMMAND_REQUEST, COMMAND_RESULT, STATE_SNAPSHOT, LOSS_REPORT, LOSS_ACK):
         raise ProtocolError("unsupported message type")
     if flags != 0:
         raise ProtocolError("unsupported flags")
@@ -145,7 +173,7 @@ def decode_frame(frame: bytes) -> tuple[Header, TelemetrySample | TelemetryAck]:
     expected_payload_length = {
         TELEMETRY_SAMPLE: TELEMETRY_SAMPLE_PAYLOAD_LENGTH,
         TELEMETRY_ACK: TELEMETRY_ACK_PAYLOAD_LENGTH,
-        COMMAND_SESSION: 24, COMMAND_REQUEST: 40, COMMAND_RESULT: 32,
+        COMMAND_SESSION: 24, COMMAND_REQUEST: 40, COMMAND_RESULT: 32, STATE_SNAPSHOT: 64, LOSS_REPORT: 48, LOSS_ACK: 20,
     }[message_type]
     if payload_length != expected_payload_length:
         if message_type == TELEMETRY_SAMPLE:
@@ -185,7 +213,14 @@ def decode_frame(frame: bytes) -> tuple[Header, TelemetrySample | TelemetryAck]:
             flight_boot_id=values[1],
             telemetry_sequence=values[2],
         )
+    elif message_type == LOSS_REPORT:
+        message = LossReport(*struct.unpack("!IQQQQQI",payload))
+        validate_loss(message)
     else:
+        if message_type == STATE_SNAPSHOT:
+            session,sequence,identifier,status,reserved,enabled,period,generation,fault,effects,now=struct.unpack('!QQQIIIIIIQQ',payload)
+            if status or reserved or enabled not in (0,1) or fault not in (0,1) or not 0 <= period <= 60000:
+                raise ProtocolError('invalid state snapshot')
         message = ControlMessage(payload)
 
     return header, message
@@ -221,7 +256,7 @@ class FrameParser:
                 raise ProtocolError("bad magic")
             if version != VERSION:
                 raise ProtocolError("unsupported version")
-            if message_type not in (TELEMETRY_SAMPLE, TELEMETRY_ACK, COMMAND_SESSION, COMMAND_REQUEST, COMMAND_RESULT):
+            if message_type not in (TELEMETRY_SAMPLE, TELEMETRY_ACK, COMMAND_SESSION, COMMAND_REQUEST, COMMAND_RESULT, STATE_SNAPSHOT, LOSS_REPORT, LOSS_ACK):
                 raise ProtocolError("unsupported message type")
             if flags != 0:
                 raise ProtocolError("unsupported flags")
@@ -234,7 +269,7 @@ class FrameParser:
             expected_payload_length = {
                 TELEMETRY_SAMPLE: TELEMETRY_SAMPLE_PAYLOAD_LENGTH,
                 TELEMETRY_ACK: TELEMETRY_ACK_PAYLOAD_LENGTH,
-                COMMAND_SESSION: 24, COMMAND_REQUEST: 40, COMMAND_RESULT: 32,
+                COMMAND_SESSION: 24, COMMAND_REQUEST: 40, COMMAND_RESULT: 32, STATE_SNAPSHOT: 64, LOSS_REPORT: 48, LOSS_ACK: 20,
             }[message_type]
             if payload_length != expected_payload_length:
                 if message_type == TELEMETRY_SAMPLE:

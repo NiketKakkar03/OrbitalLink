@@ -19,7 +19,7 @@ from ground.orbit_protocol import (
     FrameParser,
     ProtocolError,
     TELEMETRY_SAMPLE,
-    COMMAND_SESSION, COMMAND_RESULT, ControlMessage,
+    COMMAND_SESSION, COMMAND_RESULT, STATE_SNAPSHOT, LOSS_REPORT, LossReport, encode_loss_ack, ControlMessage,
     TelemetryAck,
     TelemetrySample,
     encode_telemetry_ack,
@@ -74,6 +74,16 @@ class GroundReceiver:
             for header, message in parser.feed(chunk):
                 if header.message_type == COMMAND_SESSION and isinstance(message, ControlMessage):
                     if self.broker: self.broker.open(*struct.unpack('!QQQ',message.payload))
+                    continue
+                if header.message_type == LOSS_REPORT and isinstance(message, LossReport):
+                    self._storage.store_loss(message)
+                    connection.sendall(encode_loss_ack(message))
+                    continue
+                if header.message_type == STATE_SNAPSHOT and isinstance(message, ControlMessage):
+                    if self.broker: self.broker.snapshot(message.payload)
+                    session,sequence,identifier,*_=struct.unpack('!QQQIIIIIIQQ',message.payload)
+                    if hasattr(self._storage,'record_command_result'):
+                        self._storage.record_command_result(command_id=identifier,command_session_id=session,command_sequence=sequence,status='applied',details=message.payload.hex())
                     continue
                 if header.message_type == COMMAND_RESULT and isinstance(message, ControlMessage):
                     if self.broker: self.broker.result(message.payload)

@@ -36,7 +36,7 @@ def tls_flight(tmp_path_factory):
     if sanitizers:
         flags += [f"-fsanitize={sanitizers}", "-fno-omit-frame-pointer", "-g"]
     subprocess.run(["c++", "-std=c++20", "-Wall", "-Wextra", "-Werror", "-pthread",
-                    *flags, "flight/flight_service.cpp", "-o", str(output), "-lssl", "-lcrypto"],
+                    *flags, "flight/flight_service.cpp", "flight/durable_outbox.cpp", "-o", str(output), "-lssl", "-lcrypto", "-lsqlite3"],
                    cwd=ROOT, check=True)
     return output
 
@@ -70,7 +70,7 @@ def test_tls_authentication_and_identity(tmp_path, certificates, tls_flight, ide
         result = subprocess.run([str(tls_flight), "127.0.0.1", str(port), "--count", "4",
             "--interval-ms", "0", "--drain-ms", "500", "--ca", str(certificates / "ca.pem"),
             "--cert", str(certificates / f"{identity}.pem"), "--key", str(certificates / f"{identity}.key"),
-            "--server-name", server_name], capture_output=True, text=True, timeout=5)
+            "--server-name", server_name, "--outbox", str(tmp_path/"outbox.db")], capture_output=True, text=True, timeout=5)
         assert result.returncode == 0, result.stderr
         assert json.loads(result.stdout)["acknowledged"] == expected
         storage = TelemetryStorage(database)
@@ -146,7 +146,7 @@ def test_flight_rejects_invalid_server_validity(tmp_path, certificates, tls_flig
         result = subprocess.run([str(tls_flight), "127.0.0.1", str(port), "--count", "4",
             "--interval-ms", "0", "--drain-ms", "500", "--ca", str(certificates / "ca.pem"),
             "--cert", str(certificates / "flight.pem"), "--key", str(certificates / "flight.key"),
-            "--server-name", "ground.orbital.test"], capture_output=True, text=True, timeout=5)
+            "--server-name", "ground.orbital.test", "--outbox", str(tmp_path/"outbox.db")], capture_output=True, text=True, timeout=5)
         assert result.returncode == 0, result.stderr
         assert json.loads(result.stdout)["acknowledged"] == 0
         storage = TelemetryStorage(database)
@@ -181,14 +181,14 @@ def test_ground_stalled_handshake_shutdown(tmp_path, certificates):
             ground.communicate()
 
 
-def test_flight_stalled_handshake_shutdown(certificates, tls_flight):
+def test_flight_stalled_handshake_shutdown(tmp_path, certificates, tls_flight):
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         listener.listen()
         listener.settimeout(3)
         process = subprocess.Popen([str(tls_flight), "127.0.0.1", str(listener.getsockname()[1]),
             "--ca", str(certificates / "ca.pem"), "--cert", str(certificates / "flight.pem"),
-            "--key", str(certificates / "flight.key"), "--server-name", "ground.orbital.test"],
+            "--key", str(certificates / "flight.key"), "--server-name", "ground.orbital.test", "--outbox", str(tmp_path/"outbox.db")],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
             with listener.accept()[0]:

@@ -1,6 +1,7 @@
 """Real authenticated native peer tests for flight command effects and rejection."""
 from __future__ import annotations
 
+import tempfile
 import json
 import sys
 import sqlite3
@@ -29,8 +30,9 @@ class FlightPeer:
         context.verify_mode = ssl.CERT_REQUIRED
         context.load_verify_locations(certificates / "ca.pem")
         context.load_cert_chain(certificates / f"{identity}.pem", certificates / f"{identity}.key")
+        self.outbox_dir=tempfile.TemporaryDirectory()
         arguments = [str(executable), "127.0.0.1", str(self.listener.getsockname()[1]),
-            "--interval-ms", "10", "--ca", str(certificates / "ca.pem"),
+            "--interval-ms", "10", "--outbox", str(Path(self.outbox_dir.name)/"outbox.db"), "--ca", str(certificates / "ca.pem"),
             "--cert", str(certificates / "flight.pem"), "--key", str(certificates / "flight.key"),
             "--server-name", f"{identity}.orbital.test"]
         if fault:
@@ -159,7 +161,7 @@ def test_local_operator_cli_persists_applied_reset(tmp_path, certificates, tls_f
                 assert time.monotonic()<deadline
                 time.sleep(.02)
             flight = subprocess.Popen([str(tls_flight), "127.0.0.1", ready.read_text().strip(),
-                "--interval-ms", "10", "--ca", str(certificates / "ca.pem"),
+                "--interval-ms", "10", "--outbox", str(Path(directory)/"outbox.db"), "--ca", str(certificates / "ca.pem"),
                 "--cert", str(certificates / "flight.pem"), "--key", str(certificates / "flight.key"),
                 "--server-name", "ground.orbital.test", "--authorized-command-server", "ground.orbital.test"],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -172,6 +174,12 @@ def test_local_operator_cli_persists_applied_reset(tmp_path, certificates, tls_f
                                     cwd=ROOT, capture_output=True, text=True, timeout=4)
             assert result.returncode == 0, result.stderr
             assert json.loads(result.stdout)["status"] == "applied"
+            query=subprocess.run([sys.executable,"-m","ground.orbit_commands","--socket",str(control),"query-state"],cwd=ROOT,capture_output=True,text=True,timeout=4)
+            assert query.returncode==0,query.stderr
+            snapshot=json.loads(query.stdout)
+            assert snapshot["status"]=="applied"
+            assert snapshot["state"]["generation"]==8 and snapshot["state"]["effects"]==1
+            assert snapshot["state"]["enabled"] and snapshot["state"]["period_ms"]==10
             with sqlite3.connect(database) as connection:
                 while not connection.execute("SELECT count(*) FROM command_results").fetchone()[0]:
                     assert time.monotonic()<deadline
@@ -237,3 +245,16 @@ def test_service_restart_rejects_old_session(certificates, tls_flight):
     finally:
         summary = restarted.close()
     assert summary["command_effects"] == 1
+
+def test_read_only_query_snapshot_after_command(certificates, tls_flight):
+    from ground.orbit_protocol import STATE_SNAPSHOT
+    peer=FlightPeer(certificates,tls_flight)
+    try:
+        assert peer.command(1,2)==0
+        peer.connection.sendall(encode_control(4,struct.pack('!QQQQII',peer.session,2,2,peer.now+4_000_000_000,6,0)))
+        _,message=peer.receive(STATE_SNAPSHOT)
+        session,sequence,identifier,status,reserved,enabled,period,generation,fault,effects,now=struct.unpack('!QQQIIIIIIQQ',message.payload)
+        assert (session,sequence,identifier,status,reserved)==(peer.session,2,2,0,0)
+        assert enabled==0 and effects==1 and period==10 and generation==7 and fault==0 and now>=peer.now
+    finally:
+        peer.close()

@@ -1,11 +1,12 @@
 """Durable SQLite storage for decoded OrbitalLink telemetry samples."""
 
+import json
 import sqlite3
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from ground.orbit_protocol import TelemetrySample
+from ground.orbit_protocol import TelemetrySample, LossReport, validate_loss
 
 
 _UINT32_MAX = (1 << 32) - 1
@@ -115,7 +116,29 @@ class TelemetryStorage:
             )
             """
         )
+        self.connection.execute("""CREATE TABLE IF NOT EXISTS loss_reports (
+            spacecraft_id INTEGER NOT NULL, flight_boot_id TEXT NOT NULL, report_id TEXT NOT NULL,
+            first_sequence TEXT NOT NULL, last_sequence TEXT NOT NULL, lost_count TEXT NOT NULL,
+            reason INTEGER NOT NULL, PRIMARY KEY(spacecraft_id,flight_boot_id,report_id))""")
         self.connection.commit()
+
+    def store_loss(self, loss: LossReport) -> bool:
+        validate_loss(loss)
+        values=(loss.spacecraft_id,*(_encode_uint64(v) for v in (loss.flight_boot_id,loss.report_id,loss.first,loss.last,loss.count)),loss.reason)
+        try:
+            existing=self.connection.execute('SELECT * FROM loss_reports WHERE spacecraft_id=? AND flight_boot_id=? AND report_id=?',values[:3]).fetchone()
+            if existing is not None and existing != values:
+                raise ValueError('loss identity reused with different contents')
+            inserted=existing is None
+            if inserted:
+                self.connection.execute('INSERT INTO loss_reports VALUES (?,?,?,?,?,?,?)',values)
+                details=json.dumps({'boot':loss.flight_boot_id,'report_id':loss.report_id,'first':loss.first,'last':loss.last,'count':loss.count,'reason':loss.reason,'spacecraft_id':loss.spacecraft_id},sort_keys=True)
+                self.connection.execute('INSERT INTO event_details(received_at_unix_ns,event_type,details) VALUES (?,?,?)',(_encode_uint64(time.time_ns()),'telemetry_loss',details))
+            self.connection.commit()
+            return inserted
+        except Exception:
+            self.connection.rollback()
+            raise
 
     def store_sample(
         self,

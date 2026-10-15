@@ -239,7 +239,7 @@ def test_rejects_bad_ack_payload_length():
     with pytest.raises(ProtocolError, match="bad telemetry ACK payload length"):
         decode_frame(bytes(frame))
 
-@pytest.mark.parametrize('name', ['command_session','command_request','command_result'])
+@pytest.mark.parametrize('name', ['command_session','command_request','command_result','state_snapshot','loss_ack'])
 def test_command_golden_frames_and_fragmentation(name):
     from ground.orbit_protocol import encode_control, ControlMessage
     fixture=json.loads((FIXTURE_PATH.parent / f'{name}_v1.json').read_text())

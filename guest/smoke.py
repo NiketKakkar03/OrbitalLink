@@ -158,7 +158,8 @@ def main():
             result = {'status': 'passed', 'summary': summary, 'versions': VERSIONS,
                       'image_sha256': manifest['artifacts_sha256'],
                       'host_alias': args.host, 'port': args.port, 'server_name': args.server_name,
-                      'gate': 'guest boot and fake-source mTLS durable ACK count; ground database verification separate'}
+                      'gate': ('guest boot, driver syscall/lifecycle and device-source mTLS durable ACK count; ground database verification separate'
+                               if args.driver_tests else 'guest boot and fake-source mTLS durable ACK count; ground database verification separate')}
             console.send('poweroff')
             child.wait(timeout=20)
             if child.returncode:

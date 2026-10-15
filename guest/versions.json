@@ -20,7 +20,7 @@
     "triplet": "aarch64-buildroot-linux-gnu"
   },
   "sources_verified": "2026-10-14",
-  "status": "development pins; build and boot gate pending",
+  "status": "development pins; runtime gate evidence recorded separately",
   "audit_sources": [
     "https://buildroot.org/download.html",
     "https://github.com/buildroot/buildroot/tree/d030e36bbc9669230c015be971b14b6e062cfdde"

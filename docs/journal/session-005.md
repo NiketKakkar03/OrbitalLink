@@ -47,3 +47,8 @@ M6 database checks confirmed device generation 1, consecutive device sequences,
 the kernel source temperature formula, 3,300 mV and positive monotonic timestamps.
 This validates the timer-driven test backend; the custom MMIO/IRQ device and
 additional driver command/state UAPI are still future work.
+
+The driver telemetry run reported `177 = 164 enqueued + 13 dropped`, and
+`164 = 100 delivered + 64 queued`. All 100 acquired samples were durably
+acknowledged; this is not a claim of zero device-source loss or a throughput
+benchmark. Kernel-loss reporting and backpressure measurements remain M8 work.

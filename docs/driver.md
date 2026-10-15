@@ -72,3 +72,10 @@ rejected until real driver controls/state are implemented. Driver FIFO loss
 counters are separate from the durable outbox's acknowledged loss reports.
 Device-to-ground validation passed for this test backend. Wider fault injection,
 benchmarking and real MMIO/IRQ acquisition remain later gates.
+
+The first device telemetry run reported 177 generated records: 164 enqueued plus
+13 drop-newest losses. Of the enqueued records, 100 were delivered to flight and
+64 remained queued. All 100 acquired flight samples were durably acknowledged.
+These counters reconcile, but do not establish lossless sustained throughput.
+Rate/backpressure measurements and durable reporting of kernel FIFO losses are
+M8 work; outbox loss reports currently describe flight-retention losses only.

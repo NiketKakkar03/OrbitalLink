@@ -141,13 +141,16 @@ def build(work, jobs):
         for directory in [REPO / 'qemu', REPO / 'simulation']
         for p in sorted(directory.rglob('*')) if p.is_file() and '__pycache__' not in p.parts}
     manifest['qemu_executable_sha256'] = digest(out / 'host/bin/qemu-system-aarch64')
-    modules = sorted((out / 'target/lib/modules').rglob('orbit_test.ko'))
+    modules = sorted((out / 'target/lib/modules').rglob('orbit_*.ko'))
     if modules:
         manifest['driver_sha256'] = {str(p.relative_to(REPO)): digest(p)
             for p in sorted((REPO / 'driver').rglob('*')) if p.is_file() and
             (p.suffix in {'.c', '.h', '.sh'} or p.name == 'Makefile')}
         manifest['driver_module_sha256'] = {str(p.relative_to(out / 'target')): digest(p) for p in modules}
         manifest['driver_harness_sha256'] = digest(out / 'target/usr/bin/orbit-syscall-contract')
+        sensor_harness = out / 'target/usr/bin/orbit-sensors-contract'
+        if sensor_harness.exists():
+            manifest['sensor_harness_sha256'] = digest(sensor_harness)
     manifest['host'] = {'system': platform.system(), 'machine': platform.machine()}
     manifest['status'] = 'image built; boot and mTLS telemetry gates pending'
     (out / 'images/orbit-manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')

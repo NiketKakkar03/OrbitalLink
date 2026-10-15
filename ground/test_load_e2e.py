@@ -1,6 +1,7 @@
 """Deliberate TLS receiver overload must remain bounded and fully accounted."""
 import json
 import socket
+import sqlite3
 import ssl
 import subprocess
 import threading
@@ -19,8 +20,21 @@ def test_overload_with_slow_durable_receiver_is_explicit(tmp_path,certificates,t
     listener=socket.socket();listener.bind(('127.0.0.1',0));listener.listen();listener.settimeout(.1)
     stop=threading.Event();ready=threading.Event();errors=[]
     class SlowStorage(TelemetryStorage):
+        held=False
         def store_sample(self,*args,**kwargs):
             inserted=super().store_sample(*args,**kwargs)
+            if not self.held:
+                self.held=True
+                # Force genuine overload rather than assuming a particular SSD
+                # is faster than this receiver: capacity32 must see64 commits
+                # before the first ACK, while the window protects8 rows.
+                deadline=time.monotonic()+4
+                while True:
+                    with sqlite3.connect(outbox,timeout=.1) as probe:
+                        generated=probe.execute("SELECT value FROM counters WHERE name='generated'").fetchone()[0]
+                    if generated>=64:break
+                    if time.monotonic()>deadline:raise RuntimeError('producer did not reach overload barrier')
+                    time.sleep(.01)
             time.sleep(.02)  # 50 receipts/s ceiling, independent of sender window.
             return inserted
     def receive():
@@ -43,8 +57,8 @@ def test_overload_with_slow_durable_receiver_is_explicit(tmp_path,certificates,t
     worker=threading.Thread(target=receive);worker.start()
     try:
         assert ready.wait(5) and not errors,errors
-        command=[str(tls_flight),'127.0.0.1',str(listener.getsockname()[1]),'--source','scenario','--count','1000','--interval-ms','1','--capacity','32','--send-window','8','--priority-scheduling','1','--outbox',str(outbox),'--io-timeout-ms','1000','--drain-ms','3000','--ca',str(certificates/'ca.pem'),'--cert',str(certificates/'flight.pem'),'--key',str(certificates/'flight.key'),'--server-name','ground.orbital.test']
-        result=subprocess.run(command,capture_output=True,text=True,timeout=25)
+        command=[str(tls_flight),'127.0.0.1',str(listener.getsockname()[1]),'--source','scenario','--count','1000','--interval-ms','1','--capacity','32','--send-window','8','--priority-scheduling','1','--outbox',str(outbox),'--io-timeout-ms','5000','--drain-ms','3000','--ca',str(certificates/'ca.pem'),'--cert',str(certificates/'flight.pem'),'--key',str(certificates/'flight.key'),'--server-name','ground.orbital.test']
+        result=subprocess.run(command,capture_output=True,text=True,timeout=60)
         assert result.returncode==0,result.stderr
         summary=json.loads(result.stdout)
         expected=1000+sum(i%600 in (100,200,260,300,350,400) for i in range(1000))

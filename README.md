@@ -166,7 +166,12 @@ that does not honor synchronization remain outside that guarantee.
 
 Native M4 is implemented and locally validated; see
 [the M4 journal](docs/journal/session-004.md) for results and limitations.
-Guest and driver prototypes await their own validation. ARM64 guest boot, driver syscall/lifecycle testing,
+The ARM64 cross-toolchain, kernel and complete image build pass in the Linux
+builder on Apple Silicon; see [guest setup](docs/guest.md).
+Guest boot and two-boot persistent replay passed: seven retained samples plus
+100 new samples reached durable ground storage over mutual TLS.
+The [driver test backend and flight adapter](docs/driver.md) have host contract
+and native adapter tests; driver syscall/lifecycle testing,
 custom QEMU MMIO/IRQ acquisition, and the full embedded fault/benchmark suite
 remain separate completion gates. Native tests establish the host telemetry
 path only. See [the roadmap](OrbitalLink_Roadmap.md) for the dependent milestones.

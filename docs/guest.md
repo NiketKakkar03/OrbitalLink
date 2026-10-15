@@ -28,12 +28,14 @@ After a failed build, `docker start orbit-build` recopies current project
 sources and resumes cached packages. Inspect the error first. Do not remove
 the volume: it contains persistent guest state as well as caches.
 
-## Version audit and gate status (2026-10-14)
+## Version audit and gate status (2026-10-15)
 
 Docker Desktop was started and reported server 28.1.1, Linux, aarch64. The
 ARM64 builder was built successfully and its Linux tool preflight passed.
-Buildroot configuration succeeded; full image compilation is underway.
-Guest boot, TLS telemetry and driver runtime remain unverified until executed.
+The complete cross-toolchain, kernel, QEMU, libraries, rootfs and flight image
+built successfully. M5 passed in `build/guest-evidence/m5-run-005/result.json`: two
+real guest boots delivered 107 authenticated ground rows, with original boot
+identity counts of seven and 100. Driver runtime validation remains a separate gate.
 
 The supported Buildroot 2025.02.18 LTS release was selected from the
 [official download page](https://buildroot.org/download.html), with exact Git
@@ -52,7 +54,7 @@ while the state disk explicitly disables snapshots. The smoke mounts `/dev/vdb`
 at `/var/lib/orbit` and supplies `--outbox /var/lib/orbit/outbox.db`.
 Only one QEMU instance may use that disk at a time. Shut down cleanly before
 copying it for backup. A snapshot of the root disk alone does not preserve the
-outbox. Two-boot replay and abrupt-power-loss tests remain required.
+outbox. Two-boot replay passed. Abrupt-power-loss testing remains a separate gate.
 
 The prepared Linux-only gate runner is:
 
@@ -74,3 +76,9 @@ source/config hashes and version pins to
 no private key material. Start ground in the same Linux container/network
 namespace so QEMU's `10.0.2.2` alias reaches it; a ground server on macOS instead
 needs separately verified Docker-to-host networking.
+
+The root and state disks use explicit PCI slots to make their Linux device
+ordering stable on the pinned machine. The runner verifies the state-disk label
+before mounting it. Serial parsing normalizes CRLF variants while retaining raw
+serial evidence; temporary credentials are provisioned only after guest echo is
+confirmed disabled.

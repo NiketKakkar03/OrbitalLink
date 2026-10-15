@@ -36,6 +36,8 @@ class RecipeTests(unittest.TestCase):
         self.assertNotIn('-snapshot', args)
         self.assertTrue(any('id=rootfs,snapshot=on' in value for value in args))
         self.assertTrue(any('id=state,snapshot=off' in value for value in args))
+        self.assertIn('virtio-blk-pci,drive=rootfs,bus=pcie.0,addr=0x1', args)
+        self.assertIn('virtio-blk-pci,drive=state,bus=pcie.0,addr=0x2', args)
         self.assertIn('tcg', args)
         self.assertIn('user,id=net0', args)
         self.assertFalse(any('hostfwd' in value for value in args))

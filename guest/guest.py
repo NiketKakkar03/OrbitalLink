@@ -32,9 +32,9 @@ def command(out, state=None):
             '-nographic', '-no-reboot', '-kernel', out / 'images/Image',
             '-append', 'root=/dev/vda rw console=ttyAMA0',
             '-drive', f"file={out / 'images/rootfs.ext4'},if=none,format=raw,id=rootfs,snapshot=on",
-            '-device', 'virtio-blk-device,drive=rootfs',
+            '-device', 'virtio-blk-pci,drive=rootfs,bus=pcie.0,addr=0x1',
             '-drive', f"file={state},if=none,format=raw,id=state,snapshot=off",
-            '-device', 'virtio-blk-device,drive=state',
+            '-device', 'virtio-blk-pci,drive=state,bus=pcie.0,addr=0x2',
             '-object', 'rng-random,id=rng0,filename=/dev/urandom',
             '-device', 'virtio-rng-device,rng=rng0,max-bytes=1024,period=1000',
             '-netdev', 'user,id=net0', '-device', 'virtio-net-device,netdev=net0']
@@ -131,6 +131,13 @@ def build(work, jobs):
     if 'AArch64' not in manifest['flight_elf_header']:
         raise RuntimeError('flight executable is not AArch64')
     manifest['flight_executable_sha256'] = digest(executable)
+    modules = sorted((out / 'target/lib/modules').rglob('orbit_test.ko'))
+    if modules:
+        manifest['driver_sha256'] = {str(p.relative_to(REPO)): digest(p)
+            for p in sorted((REPO / 'driver').rglob('*')) if p.is_file() and
+            (p.suffix in {'.c', '.h', '.sh'} or p.name == 'Makefile')}
+        manifest['driver_module_sha256'] = {str(p.relative_to(out / 'target')): digest(p) for p in modules}
+        manifest['driver_harness_sha256'] = digest(out / 'target/usr/bin/orbit-syscall-contract')
     manifest['host'] = {'system': platform.system(), 'machine': platform.machine()}
     manifest['status'] = 'image built; boot and mTLS telemetry gates pending'
     (out / 'images/orbit-manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')

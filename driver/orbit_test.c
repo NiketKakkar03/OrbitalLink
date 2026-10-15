@@ -225,7 +225,8 @@ static const struct file_operations orbit_fops = {
 #ifdef CONFIG_COMPAT
 	.compat_ioctl = orbit_compat_ioctl,
 #endif
-	.llseek = no_llseek,
+	/* Linux 6.12 removed no_llseek; a NULL llseek rejects seeking. */
+	.llseek = NULL,
 };
 static int orbit_probe(struct platform_device *pdev)
 {

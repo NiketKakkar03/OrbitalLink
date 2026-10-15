@@ -40,6 +40,7 @@ int main(int argc, char **argv)
 	struct orbit_rate bad = {.abi_version = 1, .period_ms = 0};
 	struct pollfd p = {.fd = fd, .events = POLLIN};
 	assert(fd >= 0);
+	assert(lseek(fd, 0, SEEK_SET) == -1 && errno == ESPIPE);
 	alarm(20);
 	assert(open("/dev/orbit_telemetry", O_RDONLY) == -1 && errno == EBUSY);
 	assert(read(fd, samples, 0) == 0);

@@ -12,6 +12,7 @@ import shlex
 import subprocess
 import sys
 import time
+import tty
 
 from guest import REPO, VERSIONS, command, digest, prepare_state
 
@@ -51,6 +52,9 @@ class Console:
                 chunk = os.read(self.fd, 65536)
                 self.logfile.write(chunk); self.logfile.flush()
                 self.buffer += chunk
+                # Some guest console layers emit CRCRLF even with a raw host
+                # PTY. Normalize line endings only; retain original evidence.
+                self.buffer = re.sub(rb'\r+\n', b'\n', self.buffer)
                 if len(self.buffer) > 1024 * 1024:
                     raise RuntimeError('serial response exceeds bounded buffer')
 
@@ -70,6 +74,7 @@ def main():
     p.add_argument('--timeout', type=int, default=180)
     p.add_argument('--artifacts', required=True, type=Path)
     p.add_argument('--state', type=Path, help='dedicated persistent state disk; an existing disk is preserved')
+    p.add_argument('--driver-tests', action='store_true', help='run installed module syscall/lifecycle checks and use device samples')
     args = p.parse_args()
     if not 1 <= args.port <= 65535 or not 0 <= args.count <= 10000 or args.replay_count < 0 or args.timeout < 1:
         p.error('port/count/timeout outside supported range')
@@ -85,6 +90,8 @@ def main():
                    for name, path in [('ca', args.ca), ('cert', args.cert), ('key', args.key)]}
     args.artifacts.mkdir(parents=True, exist_ok=False)
     master, slave = pty.openpty()
+    # QEMU already supplies terminal CRLF; host line discipline must not add CR.
+    tty.setraw(slave)
     child = None
     try:
         with (args.artifacts / 'serial.log').open('wb') as logfile:
@@ -99,7 +106,7 @@ def main():
             console.send("stty -echo && printf '\\nORBIT_ECHO_OFF\\n'")
             console.wait(rb'\r?\nORBIT_ECHO_OFF\r?\n', 10)
             console.send(f'date -u -s @{int(time.time())}')
-            console.send("uname -a; date -u; ldd /usr/bin/orbit-flight; ip addr show eth0; printf '\\nORBIT_INFO_END\\n'")
+            console.send("uname -a; date -u; /lib/ld-linux-aarch64.so.1 --list /usr/bin/orbit-flight; ip addr show eth0; printf '\\nORBIT_INFO_END\\n'")
             info = console.wait(rb'(?s)(.*?)\r?\nORBIT_INFO_END\r?\n', 20).group(1)
             if ('Linux orbit-guest ' + VERSIONS['linux']['version']).encode() not in info or b'aarch64' not in info:
                 raise RuntimeError('unexpected guest kernel/architecture')
@@ -116,13 +123,22 @@ def main():
                 console.send(f'base64 -d /tmp/orbit-credentials/{name}.b64 > /tmp/orbit-credentials/{name}.pem')
             console.send("printf '\\nORBIT_CREDENTIALS_READY\\n'")
             console.wait(rb'\r?\nORBIT_CREDENTIALS_READY\r?\n', 20)
-            console.send("mkdir -p /var/lib/orbit; mount /dev/vdb /var/lib/orbit && printf '\\nORBIT_STATE_MOUNTED\\n'")
+            console.send("mkdir -p /var/lib/orbit; blkid /dev/vdb | grep -q 'LABEL=\"orbit-state\"' && mount /dev/vdb /var/lib/orbit && printf '\\nORBIT_STATE_MOUNTED\\n'")
             console.wait(rb'\r?\nORBIT_STATE_MOUNTED\r?\n', 20)
+            if args.driver_tests:
+                console.send("orbit_module=$(find /lib/modules -name orbit_test.ko | head -n 1); test -n \"$orbit_module\" && /usr/bin/orbit-driver-tests \"$orbit_module\" /usr/bin/orbit-syscall-contract 100 /var/lib/orbit/driver-artifacts; orbit_driver_rc=$?; for orbit_artifact in /var/lib/orbit/driver-artifacts/*; do printf '\\nORBIT_DRIVER_ARTIFACT=%s\\n' \"$orbit_artifact\"; cat \"$orbit_artifact\"; done; printf '\\nORBIT_DRIVER_EXIT=%s\\n' \"$orbit_driver_rc\"")
+                driver_exit = console.wait(rb'\r?\nORBIT_DRIVER_EXIT=(\d+)\r?\n', 300)
+                if driver_exit.group(1) != b'0':
+                    raise RuntimeError('driver syscall/lifecycle gate failed; inspect serial.log')
+                console.send("insmod \"$orbit_module\" initial_period_ms=60000 && printf '\\nORBIT_DRIVER_READY\\n'")
+                console.wait(rb'\r?\nORBIT_DRIVER_READY\r?\n', 20)
             cmd = ['/usr/bin/orbit-flight', args.host, str(1 if args.offline_seed else args.port),
                    '--ca', '/tmp/orbit-credentials/ca.pem', '--cert', '/tmp/orbit-credentials/cert.pem',
                    '--key', '/tmp/orbit-credentials/key.pem', '--server-name', args.server_name,
                    '--count', str(args.count), '--interval-ms', '10',
                    '--outbox', '/var/lib/orbit/outbox.db', '--capacity', str(max(1,args.count + args.replay_count)), '--drain-ms', '3000']
+            if args.driver_tests:
+                cmd += ['--source', 'device', '--device', '/dev/orbit_telemetry']
             console.send(shlex.join(cmd) + "; orbit_rc=$?; printf '\\nORBIT_EXIT=%s\\n' \"$orbit_rc\"")
             summary_match = console.wait(rb'(\{"state":[^\r\n]+\})', args.timeout)
             summary = json.loads(summary_match.group(1))
@@ -137,6 +153,8 @@ def main():
                 for field, value in [('generated',args.count), ('acknowledged',expected), ('durable_retained',0), ('dropped_oldest',0), ('discarded_shutdown',0)]:
                     if summary.get(field) != value:
                         raise RuntimeError(f'{field}: expected {value}, got {summary.get(field)}')
+            if args.driver_tests and summary.get('source') != 'device':
+                raise RuntimeError('driver gate did not use device-origin telemetry')
             result = {'status': 'passed', 'summary': summary, 'versions': VERSIONS,
                       'image_sha256': manifest['artifacts_sha256'],
                       'host_alias': args.host, 'port': args.port, 'server_name': args.server_name,

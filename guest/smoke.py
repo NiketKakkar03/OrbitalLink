@@ -89,8 +89,9 @@ def main():
     p.add_argument('--sensor-contract', action='store_true', help='run ABI2 syscall/profile/reset checks and power off')
     p.add_argument('--interval-ms', type=int, default=10)
     p.add_argument('--seed', type=int, default=1)
+    p.add_argument('--storage-batch', type=int, default=1)
     args = p.parse_args()
-    if not 1 <= args.port <= 65535 or not 0 <= args.count <= 10000 or args.replay_count < 0 or args.timeout < 1:
+    if not 1 <= args.port <= 65535 or not 0 <= args.count <= 10000 or args.replay_count < 0 or args.timeout < 1 or not 1 <= args.storage_batch <= 16:
         p.error('port/count/timeout outside supported range')
     out = args.work.resolve() / 'output'
     state = args.state.resolve() if args.state else None
@@ -169,12 +170,13 @@ def main():
                    '--ca', '/tmp/orbit-credentials/ca.pem', '--cert', '/tmp/orbit-credentials/cert.pem',
                    '--key', '/tmp/orbit-credentials/key.pem', '--server-name', args.server_name,
                    '--count', str(args.count), '--interval-ms', str(args.interval_ms),
-                   '--outbox', '/var/lib/orbit/outbox.db', '--capacity', str(max(1,args.count + args.replay_count)), '--drain-ms', '3000']
+                   '--outbox', '/var/lib/orbit/outbox.db', '--capacity', str(max(1024 if args.sensors else 1,args.count + args.replay_count)), '--drain-ms', '3000']
             if args.driver_tests:
                 cmd += ['--source', 'device', '--device', '/dev/orbit_telemetry']
             if args.sensors:
                 cmd += ['--source', 'sensors', '--device', '/dev/orbit_sensors',
-                        '--send-window', '32', '--priority-scheduling', '1', '--io-timeout-ms', '2000']
+                        '--send-window', '32', '--priority-scheduling', '1', '--io-timeout-ms', '2000',
+                        '--storage-batch', str(args.storage_batch)]
             invocation = shlex.join(cmd)
             if args.sensors:
                 invocation += " > /var/lib/orbit/flight-summary.json 2>/var/lib/orbit/flight-stderr.log & orbit_flight_pid=$!; "

@@ -31,6 +31,7 @@ public:
     std::optional<TelemetrySample> claim_next(std::size_t maximum_claims=64);
     void release_claims();
     void acknowledge(const TelemetrySample& sample);
+    void acknowledge_batch(const std::vector<TelemetrySample>& samples);
     std::optional<DurableLoss> claim_loss();
     void acknowledge_loss(std::uint64_t id);
     std::vector<DurableLoss> losses() const;

@@ -319,6 +319,37 @@ int main(int argc,char** argv) {
         const auto counts=preserved.accounting();assert(counts.generated==2 && counts.retained==2 && counts.dropped==0 && counts.acknowledged==0);
         assert(preserved.claim()->telemetry_sequence==200);
     }
+    // Batched deletion is one atomic durable boundary. Invalid, duplicate and
+    // failed batches preserve every claim; only a successful COMMIT counts ACKs.
+    const auto ack_batch_path=(directory/"ack-batch.db").string();
+    {
+        DurableOutbox outbox(ack_batch_path,1024*1024,8,true);
+        for(std::uint64_t sequence=300;sequence<308;++sequence)outbox.push(make_sensor(sequence,6));
+        std::vector<orbit::TelemetrySample> claims;
+        for(unsigned index=0;index<8;++index){auto value=outbox.claim_next(8);assert(value);claims.push_back(*value);}
+        bool rejected=false;
+        try{outbox.acknowledge_batch({claims[0],make_sensor(999,6)});}catch(const std::logic_error&){rejected=true;}
+        assert(rejected && outbox.accounting().acknowledged==0 && outbox.snapshot().size==8);
+        rejected=false;
+        try{outbox.acknowledge_batch({claims[0],claims[0]});}catch(const std::logic_error&){rejected=true;}
+        assert(rejected && outbox.accounting().acknowledged==0);
+        sqlite3* db{};assert(sqlite3_open(ack_batch_path.c_str(),&db)==SQLITE_OK);
+        assert(sqlite3_exec(db,"CREATE TRIGGER reject_ack_batch BEFORE DELETE ON samples WHEN OLD.id=2 BEGIN SELECT RAISE(ABORT,'injected ACK batch failure'); END",nullptr,nullptr,nullptr)==SQLITE_OK);
+        sqlite3_close(db);
+        rejected=false;
+        try{outbox.acknowledge_batch({claims[0],claims[1],claims[2]});}catch(const std::runtime_error&){rejected=true;}
+        assert(rejected && outbox.accounting().acknowledged==0 && outbox.snapshot().size==8);
+        const auto displaced=outbox.push(make_sensor(308,6));
+        assert(displaced.size()==1 && displaced[0].telemetry_sequence==308); // All eight claims remain protected.
+        assert(sqlite3_open(ack_batch_path.c_str(),&db)==SQLITE_OK);
+        assert(sqlite3_exec(db,"DROP TRIGGER reject_ack_batch",nullptr,nullptr,nullptr)==SQLITE_OK);
+        sqlite3_close(db);
+        outbox.acknowledge_batch({claims[7],claims[1],claims[0]});
+        const auto counts=outbox.accounting();
+        assert(counts.generated==9 && counts.acknowledged==3 && counts.dropped==1 && counts.retained==5);
+        outbox.acknowledge_batch({claims[2],claims[3],claims[4],claims[5],claims[6]});
+        assert(outbox.snapshot().size==0 && outbox.accounting().acknowledged==8);
+    }
     std::filesystem::remove_all(directory);
     std::cout<<"durable outbox restart, transaction rollback, immutable losses, ownership and disk budget checks passed\n";
 }

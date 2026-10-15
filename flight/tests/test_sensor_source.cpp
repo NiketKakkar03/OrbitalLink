@@ -10,6 +10,7 @@ struct SensorIo:orbit::DeviceIo {
     bool ready(int ms)override {assert(ms==25);return true;}
     std::ptrdiff_t read_records(void* output,std::size_t bytes)override {requested=bytes;if(result==64)std::memcpy(output,&record,64);return result;}
     orbit_stats stats()override{return status;}
+    orbit_sensor_events events_info()override{return {100,99,0,1,0};}
     bool set_rate(const orbit_rate& r)override{assert(r.abi_version==2 && !r.reserved[0] && !r.reserved[1]);return rate_ok;}
 };
 static bool rejects(const std::function<void()>& f){try{f();}catch(const std::exception&){return true;}return false;}
@@ -20,6 +21,7 @@ int main(){
     auto sample=orbit::SensorSource::telemetry(records[0],123,456);
     assert(sample.category==2 && sample.device_sequence==17 && sample.values[0]==-5000 && sample.temperature_millideg_c==-5000);
     assert(orbit::decode_frame(orbit::encode_telemetry_sample(sample)).sample.values==sample.values);
+    assert(source.events_info().coalesced==99);
     assert(source.set_rate(100) && !source.set_rate(0) && !source.set_rate(60001));
     io->rate_ok=false;assert(!source.set_rate(10));
     for(auto bytes:{0,1,63,65,1025}){io->result=bytes;assert(rejects([&]{source.read(1);}));}

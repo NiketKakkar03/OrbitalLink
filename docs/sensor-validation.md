@@ -129,3 +129,14 @@ Before calling this a release:
   protocol as CCSDS compliant.
 
 No release tag or publication is implied by passing an individual benchmark.
+
+Optional `--storage-batch 1..16` groups only already-arrived matching ACKs into
+one FULL-synchronous deletion transaction. Default 1 preserves the original
+commit path. A batch never waits to become full. Unknown/duplicate ACKs retain
+unacknowledged samples; a valid prefix commits independently before reconnect.
+Acquisition still commits samples individually. The optimization does not imply
+a measured embedded throughput improvement until its comparison gate passes.
+
+Both endpoints need type 9 support for multisensor exchange; no automatic
+downgrade discards category fields. Existing type 1 messages remain supported.
+Database migrations preserve the legacy rows and full typed metadata.

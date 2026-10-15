@@ -31,6 +31,9 @@ struct OrbitHub {
     uint64_t tick, generated, dropped, popped;
     uint64_t snapshot_generated, snapshot_dropped;
     uint64_t snapshot_ns;
+    uint64_t driver_delivered, driver_dropped, snapshot_popped;
+    uint64_t snapshot_driver_delivered, snapshot_driver_dropped;
+    struct orbit_event_accumulator snapshot_events;
     uint32_t snapshot_queued, snapshot_generation, snapshot_resets;
     bool overrun;
     struct orbit_event_accumulator events;
@@ -76,10 +79,10 @@ static void hub_tick(void *opaque)
     if (routine.category == 4) {
         routine.values[0] = (qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 1000000000LL) & INT32_MAX;
         routine.values[1] = s->reset_count;
-        routine.values[2] = s->count;
+        routine.values[2] = s->count + s->popped - s->driver_delivered - s->driver_dropped;
         routine.values[3] = s->generated & INT32_MAX;
-        routine.values[4] = s->popped & INT32_MAX;
-        routine.values[5] = s->dropped & INT32_MAX;
+        routine.values[4] = s->driver_delivered & INT32_MAX;
+        routine.values[5] = (s->dropped + s->driver_dropped) & INT32_MAX;
     }
     if (has_event) {
         orbit_event_push(&s->events, &event);
@@ -140,6 +143,25 @@ static uint64_t hub_read(void *opaque, hwaddr offset, unsigned size)
     case 0xc0: return s->snapshot_ns;
     case 0xc4: return s->snapshot_ns >> 32;
     case 0xd0: return s->fault_category;
+    case 0xe0: return s->driver_delivered;
+    case 0xe4: return s->driver_delivered >> 32;
+    case 0xe8: return s->driver_dropped;
+    case 0xec: return s->driver_dropped >> 32;
+    case 0xf8: return s->popped;
+    case 0xfc: return s->popped >> 32;
+    case 0x100: return s->snapshot_popped;
+    case 0x104: return s->snapshot_popped >> 32;
+    case 0x108: return s->snapshot_driver_delivered;
+    case 0x10c: return s->snapshot_driver_delivered >> 32;
+    case 0x110: return s->snapshot_driver_dropped;
+    case 0x114: return s->snapshot_driver_dropped >> 32;
+    case 0x120: return s->snapshot_events.observations;
+    case 0x124: return s->snapshot_events.observations >> 32;
+    case 0x128: return s->snapshot_events.coalesced;
+    case 0x12c: return s->snapshot_events.coalesced >> 32;
+    case 0x130: return s->snapshot_events.overflow;
+    case 0x134: return s->snapshot_events.overflow >> 32;
+    case 0x138: return s->snapshot_events.count;
     default:
         if (offset >= 0x40 && offset < 0x80 && s->count) {
             return sample_word(&s->fifo[s->head], (offset - 0x40) / 4);
@@ -208,6 +230,10 @@ static void hub_write(void *opaque, hwaddr offset, uint64_t value,
             s->snapshot_generation = s->generation;
             s->snapshot_resets = s->reset_count;
             s->snapshot_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+            s->snapshot_popped = s->popped;
+            s->snapshot_driver_delivered = s->driver_delivered;
+            s->snapshot_driver_dropped = s->driver_dropped;
+            s->snapshot_events = s->events;
         }
         break;
     case 0xd0:
@@ -220,6 +246,16 @@ static void hub_write(void *opaque, hwaddr offset, uint64_t value,
                 orbit_event_push(&s->events, &event);
                 hub_flush_events(s);
             }
+        }
+        break;
+    case 0xf0:
+        if (value <= s->popped - s->driver_delivered - s->driver_dropped) {
+            s->driver_delivered += value;
+        }
+        break;
+    case 0xf4:
+        if (value <= s->popped - s->driver_delivered - s->driver_dropped) {
+            s->driver_dropped += value;
         }
         break;
     default: break;

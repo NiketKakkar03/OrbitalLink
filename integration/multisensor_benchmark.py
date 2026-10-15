@@ -26,6 +26,7 @@ def main():
     parser.add_argument('--seconds',type=int,default=600)
     parser.add_argument('--rate',type=int,choices=[10,100,1000],default=10)
     parser.add_argument('--window',type=int,default=32)
+    parser.add_argument('--storage-batch',type=int,choices=range(1,17),default=1)
     args=parser.parse_args()
     if not 1<=args.seconds<=3600 or not 1<=args.window<=64:parser.error('invalid duration/window')
     output=args.output.resolve();output.mkdir(parents=True,exist_ok=False)
@@ -47,7 +48,7 @@ def main():
             while not ready.exists():
                 if ground.poll() is not None or time.monotonic()>deadline:raise RuntimeError('ground readiness failed')
                 time.sleep(.05)
-            command=[str(executable),'127.0.0.1',ready.read_text().strip(),'--source','scenario','--scenario-seed','42','--count',str(count),'--interval-ms',str(1000//args.rate),'--send-window',str(args.window),'--priority-scheduling','1','--capacity',str(max(1024,expected)),'--outbox',str(output/'outbox.db'),'--ca',str(certs/'ca.pem'),'--cert',str(certs/'flight.pem'),'--key',str(certs/'flight.key'),'--server-name','ground.orbital.test','--io-timeout-ms','2000','--drain-ms','3000']
+            command=[str(executable),'127.0.0.1',ready.read_text().strip(),'--source','scenario','--scenario-seed','42','--count',str(count),'--interval-ms',str(1000//args.rate),'--send-window',str(args.window),'--storage-batch',str(args.storage_batch),'--priority-scheduling','1','--capacity',str(max(1024,expected)),'--outbox',str(output/'outbox.db'),'--ca',str(certs/'ca.pem'),'--cert',str(certs/'flight.pem'),'--key',str(certs/'flight.key'),'--server-name','ground.orbital.test','--io-timeout-ms','2000','--drain-ms','3000']
             (output/'command.json').write_text(json.dumps(command,indent=2)+'\n')
             started=time.monotonic();flight=subprocess.Popen(command,cwd=ROOT,stdout=flog,stderr=subprocess.PIPE,start_new_session=True)
             resources=[]

@@ -34,6 +34,7 @@ public:
     virtual std::ptrdiff_t read_records(void* destination,std::size_t bytes)=0;
     virtual orbit_stats stats()=0;
     virtual bool set_rate(const orbit_rate& rate)=0;
+    virtual orbit_sensor_events events_info() {return {};}
     virtual orbit_sensor_clock clock_info(bool current=false) {(void)current;return {};}
 };
 #ifdef __linux__
@@ -69,6 +70,11 @@ public:
     orbit_stats stats() override {
         orbit_stats result{};
         if(::ioctl(fd_,sensors_?ORBIT_SENSOR_GET_STATS:ORBIT_IOC_GET_STATS,&result)!=0)throw std::runtime_error("telemetry GET_STATS failed");
+        return result;
+    }
+    orbit_sensor_events events_info() override {
+        orbit_sensor_events result{};
+        if(!sensors_ || ::ioctl(fd_,ORBIT_SENSOR_GET_EVENTS,&result)!=0)throw std::runtime_error("sensor event statistics query failed");
         return result;
     }
     orbit_sensor_clock clock_info(bool current=false) override {
@@ -138,6 +144,12 @@ inline std::unique_ptr<DeviceIo> open_sensor_device(const std::string& path) {
 class SensorSource {
     std::unique_ptr<DeviceIo> io_;
 public:
+    orbit_sensor_events events_info() {
+        const auto info=io_->events_info();
+        if(info.reserved || info.pending>8 || info.coalesced>info.observations || info.overflow>info.observations)
+            throw std::runtime_error("invalid sensor event counters");
+        return info;
+    }
     orbit_sensor_clock clock_info(bool current=false) {return io_->clock_info(current);}
     explicit SensorSource(std::unique_ptr<DeviceIo> io):io_(std::move(io)) {
         if(!io_)throw std::invalid_argument("missing sensor IO backend");

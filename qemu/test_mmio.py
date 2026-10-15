@@ -91,6 +91,11 @@ def main():
             assert sorted(events) == [1,2,3,4,5,6], events
             write(0x80, 1)
             assert read(0x90) == 606 and read(0x98) == 0 and read(0x84) == 0
+            assert read(0x120) == 6 and read(0x128) == 0 and read(0x138) == 0
+            write(0xf0, 606)
+            write(0xf4, 999999)  # Reject impossible accounting commits.
+            write(0x80, 1)
+            assert read(0x108) == 606 and read(0x110) == 0 and read(0x100) == 606
             tick()
             head = sample()
             assert read(0x0c) & 4

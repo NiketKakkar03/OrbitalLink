@@ -39,6 +39,11 @@ All registers are naturally aligned 32-bit little-endian accesses:
 | a4..b8 | EVENT_OBSERVATIONS /COALESCED /OVERFLOW | separate low/high64-bit observation counters |
 | c0 /c4 | SNAP_CLOCK_NS | atomic virtual-clock snapshot for guest clock calibration |
 | d0 | FAULT_CATEGORY | 0 clears;1..5 marks that category quality-fault and emits bounded sensor-fault event8; invalid writes ignored |
+| e0..ec | DRIVER_DELIVERED /DRIVER_DROPPED | retained64-bit software accounting across driver bindings |
+| f0 /f4 | DRIVER_DELIVERED_ADD /DRIVER_DROPPED_ADD | commit consumed/discarded popped records; additions exceeding unaccounted popped count are rejected |
+| f8 /fc | POPPED | cumulative hardware-to-driver transfers |
+| 100..114 | SNAP_POPPED /DRIVER_DELIVERED /DRIVER_DROPPED | coherent accounting snapshot |
+| 120..138 | SNAP_EVENT_OBSERVATIONS /COALESCED /OVERFLOW /PENDING | atomic event metadata snapshot |
 
 FIFO overflow drops newest, preserving the record being read across MMIO
 accesses. IRQ is level-high while nonempty and IRQ-enabled; the driver drains
@@ -60,6 +65,12 @@ half-bracket uncertainty. Thus ABI2 timestamps and flight ACK measurements use
 the same guest monotonic domain, rather than mixing host wall time or assuming
 the QEMU and guest boot epochs coincide. Category4 uptime is actual QEMU virtual
 seconds, independent of the selected reporting period.
+
+Driver unbind counts every discarded software record before releasing memory.
+Cumulative delivered/software-dropped totals live in QEMU and survive module
+rebind; probe recovers any previously popped but uncommitted records as explicit
+loss. A new binding therefore cannot silently reset a counter epoch. ABI2
+`GET_EVENTS` exposes the atomic event metadata separately from report counts.
 
 `qemu/test_mmio.py` tests actual QEMU virtual clock/MMIO behavior, including
 600 ticks/606 records, category mix, events, coherent latch, overflow, reset,

@@ -52,20 +52,24 @@ static void sensor_fetch(struct sensor_device *d, struct orbit_sensor_sample *s)
 static irqreturn_t sensor_irq(int irq, void *opaque)
 {
 	struct sensor_device *d = opaque;
-	struct orbit_sensor_sample sample;
+		struct orbit_sensor_sample sample;
 	unsigned long flags;
 	unsigned int budget = 64;
 	bool handled = false;
 	spin_lock_irqsave(&d->lock, flags);
 	while (!d->dead && budget-- && readl(d->base + 0x20)) {
+		bool dropped = false;
 		sensor_fetch(d, &sample);
 		if (d->count < ORBIT_SENSOR_FIFO_CAPACITY &&
 		    (sample.category == 6 || d->count < ORBIT_SENSOR_FIFO_CAPACITY - 8)) {
 			d->fifo[(d->head + d->count++) % ORBIT_SENSOR_FIFO_CAPACITY] = sample;
 		} else {
 			d->dropped++;
+			dropped = true;
 		}
 		writel(1, d->base + 0x1c);
+		if (dropped)
+			writel(1, d->base + 0xf4);
 		handled = true;
 	}
 	spin_unlock_irqrestore(&d->lock, flags);
@@ -154,6 +158,7 @@ static ssize_t sensor_read(struct file *file, char __user *buf, size_t count, lo
 		spin_lock_irqsave(&d->lock, flags);
 		d->head = (d->head + 1) % ORBIT_SENSOR_FIFO_CAPACITY;
 		d->count--; d->delivered++;
+		writel(1, d->base + 0xf0);
 		spin_unlock_irqrestore(&d->lock, flags);
 		done += sizeof(sample); ret = 0;
 	}
@@ -178,11 +183,12 @@ static long sensor_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	struct orbit_rate rate;
 	struct orbit_stats stats = {.abi_version = 2, .capacity = 320};
 	struct orbit_sensor_clock clock = {0};
+	struct orbit_sensor_events events = {0};
 	unsigned long flags;
 	u64 hardware_dropped;
 	int ret;
 	if (cmd != ORBIT_SENSOR_GET_STATS && cmd != ORBIT_SENSOR_SET_RATE && cmd != ORBIT_SENSOR_RESET &&
-	    cmd != ORBIT_SENSOR_GET_CLOCK && cmd != ORBIT_SENSOR_CLOCK_CURRENT)
+	    cmd != ORBIT_SENSOR_GET_CLOCK && cmd != ORBIT_SENSOR_CLOCK_CURRENT && cmd != ORBIT_SENSOR_GET_EVENTS)
 		return -ENOTTY;
 	if (cmd == ORBIT_SENSOR_SET_RATE) {
 		if (copy_from_user(&rate, (void __user *)arg, sizeof(rate))) return -EFAULT;
@@ -217,8 +223,15 @@ static long sensor_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		clock.uncertainty_ns = (after - before + 1) / 2;
 	} else if (cmd == ORBIT_SENSOR_SET_RATE) {
 		writel(rate.period_ms, d->base + 0x10);
+	} else if (cmd == ORBIT_SENSOR_GET_EVENTS) {
+		writel(1, d->base + 0x80);
+		events.observations = ((u64)readl(d->base + 0x124) << 32) | readl(d->base + 0x120);
+		events.coalesced = ((u64)readl(d->base + 0x12c) << 32) | readl(d->base + 0x128);
+		events.overflow = ((u64)readl(d->base + 0x134) << 32) | readl(d->base + 0x130);
+		events.pending = readl(d->base + 0x138);
 	} else {
 		d->dropped += d->count;
+		writel(d->count, d->base + 0xf4);
 		d->head = d->count = 0;
 		writel(1, d->base + 0x18);
 	}
@@ -226,6 +239,7 @@ static long sensor_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	if (!ret && cmd == ORBIT_SENSOR_GET_STATS && copy_to_user((void __user *)arg, &stats, sizeof(stats))) ret = -EFAULT;
 	if (!ret && (cmd == ORBIT_SENSOR_GET_CLOCK || cmd == ORBIT_SENSOR_CLOCK_CURRENT) &&
 	    copy_to_user((void __user *)arg, &clock, sizeof(clock))) ret = -EFAULT;
+	if (!ret && cmd == ORBIT_SENSOR_GET_EVENTS && copy_to_user((void __user *)arg, &events, sizeof(events))) ret = -EFAULT;
 	mutex_unlock(&d->io);
 	return ret;
 }
@@ -245,7 +259,7 @@ static const struct file_operations sensor_fops = {
 static int sensor_probe(struct platform_device *pdev)
 {
 	struct sensor_device *d;
-	u64 before_ns, after_ns, hardware_ns;
+	u64 before_ns, after_ns, hardware_ns, popped, previously_accounted;
 	int ret;
 	static_assert(sizeof(struct orbit_sensor_sample) == 64);
 	d = kzalloc(sizeof(*d), GFP_KERNEL);
@@ -261,6 +275,18 @@ static int sensor_probe(struct platform_device *pdev)
 	after_ns = ktime_get_ns();
 	d->clock_offset_ns = (s64)(before_ns + (after_ns - before_ns) / 2) - (s64)hardware_ns;
 	d->clock_uncertainty_ns = (after_ns - before_ns + 1) / 2;
+	d->delivered = ((u64)readl(d->base + 0x10c) << 32) | readl(d->base + 0x108);
+	d->dropped = ((u64)readl(d->base + 0x114) << 32) | readl(d->base + 0x110);
+	popped = ((u64)readl(d->base + 0x104) << 32) | readl(d->base + 0x100);
+	previously_accounted = d->delivered + d->dropped;
+	if (popped < previously_accounted) { ret = -EIO; goto fail; }
+	/* A removed/crashed prior binding may have consumed hardware records
+	 * without delivering them. Preserve those losses across bindings. */
+	while (popped > previously_accounted) {
+		u32 lost = min_t(u64, popped - previously_accounted, U32_MAX);
+		writel(lost, d->base + 0xf4);
+		d->dropped += lost; previously_accounted += lost;
+	}
 	dev_info(&pdev->dev, "clock calibration offset=%lld ns uncertainty<=%llu ns\n",
 		 (long long)d->clock_offset_ns, (unsigned long long)((after_ns - before_ns + 1) / 2));
 	d->irq = platform_get_irq(pdev, 0);
@@ -287,6 +313,9 @@ static void sensor_remove(struct platform_device *pdev)
 	spin_lock_irqsave(&d->lock, flags);
 	d->dead = true;
 	writel(0, d->base + 8);
+	d->dropped += d->count;
+	writel(d->count, d->base + 0xf4);
+	d->head = d->count = 0;
 	spin_unlock_irqrestore(&d->lock, flags);
 	mutex_unlock(&d->io);
 	devm_free_irq(&pdev->dev, d->irq, d);

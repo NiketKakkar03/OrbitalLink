@@ -24,8 +24,9 @@ def main():
     parser.add_argument('--period-ms', type=int, default=100)
     parser.add_argument('--seed', type=int, default=1)
     parser.add_argument('--skip-contract', action='store_true')
+    parser.add_argument('--storage-batch', type=int, default=1)
     args = parser.parse_args()
-    if not 1 <= args.ticks <= 9000 or not 1 <= args.period_ms <= 60000 or not 0 <= args.seed <= 0xffffffff:
+    if not 1 <= args.ticks <= 9000 or not 1 <= args.period_ms <= 60000 or not 0 <= args.seed <= 0xffffffff or not 1 <= args.storage_batch <= 16:
         parser.error('ticks/period/seed outside supported bounds')
     profile = [3,1,3,2,3,1,3,4,3,5]
     expected = Counter(profile[tick % 10] for tick in range(args.ticks))
@@ -54,7 +55,7 @@ def main():
             common = [sys.executable, str(ROOT / 'guest/smoke.py'), '--work', str(args.work.resolve()),
                 '--ca', str(credentials / 'ca.pem'), '--cert', str(credentials / 'flight.pem'),
                 '--key', str(credentials / 'flight.key'), '--port', ready.read_text().strip(),
-                '--server-name', 'ground.orbital.test', '--seed', str(args.seed)]
+                '--server-name', 'ground.orbital.test', '--seed', str(args.seed), '--storage-batch', str(args.storage_batch)]
             if not args.skip_contract:
                 run_smoke(common + ['--sensor-contract', '--count','0',
                     '--state',str(output / 'contract-state.ext4'),
@@ -135,6 +136,7 @@ def main():
                 'process_peak_rss_bytes':summary['process_peak_rss_bytes']}
             result = {'status':'passed','gate':'actual QEMU multisensor MMIO/IRQ to mTLS durable ground storage',
                 'routine_ticks':args.ticks,'period_ms':args.period_ms,'scenario_seed':args.seed,
+                'storage_batch':args.storage_batch,
                 'declared_virtual_seconds':duration,'host_wall_seconds':wall_seconds,
                 'authenticated_samples':total,'category_counts':dict(actual),
                 'source_to_ack_p95_upper_ms':p95,'source_latency_samples':summary['source_to_ack_samples'],

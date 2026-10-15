@@ -222,14 +222,26 @@ std::optional<TelemetrySample> DurableOutbox::claim_next(std::size_t maximum_cla
     std::lock_guard lock(mutex_);return claim_locked(maximum_claims);
 }
 void DurableOutbox::release_claims(){std::lock_guard lock(mutex_);claimed_.clear();}
-void DurableOutbox::acknowledge(const TelemetrySample& value) {
+void DurableOutbox::acknowledge(const TelemetrySample& value) {acknowledge_batch({value});}
+void DurableOutbox::acknowledge_batch(const std::vector<TelemetrySample>& samples) {
+    if(samples.empty() || samples.size()>16)throw std::invalid_argument("ACK batch must contain1..16 samples");
     std::lock_guard lock(mutex_);
-    auto found=std::find_if(claimed_.begin(),claimed_.end(),[&](const auto& item){const auto& stored=item.second;return stored.spacecraft_id==value.spacecraft_id && stored.flight_boot_id==value.flight_boot_id && stored.telemetry_sequence==value.telemetry_sequence;});
-    if(found==claimed_.end())throw std::logic_error("outbox ACK without matching claim");
+    std::vector<std::uint64_t> ids;
+    for(const auto& value:samples) {
+        const auto found=std::find_if(claimed_.begin(),claimed_.end(),[&](const auto& item){const auto& stored=item.second;return stored.spacecraft_id==value.spacecraft_id && stored.flight_boot_id==value.flight_boot_id && stored.telemetry_sequence==value.telemetry_sequence;});
+        if(found==claimed_.end() || std::find(ids.begin(),ids.end(),found->first)!=ids.end())throw std::logic_error("outbox ACK without matching distinct claim");
+        ids.push_back(found->first);
+    }
     exec("BEGIN IMMEDIATE");
-    try {exec("DELETE FROM samples WHERE id="+identity(found->first)+"; UPDATE counters SET value=value+1 WHERE name='acked'; COMMIT");}
-    catch(...){if(!sqlite3_get_autocommit(db_))sqlite3_exec(db_,"ROLLBACK",nullptr,nullptr,nullptr);throw;}
-    claimed_.erase(found);++popped_;
+    try {
+        for(const auto id:ids)exec("DELETE FROM samples WHERE id="+identity(id));
+        exec("UPDATE counters SET value=value+"+std::to_string(ids.size())+" WHERE name='acked'; COMMIT");
+    }catch(...) {
+        if(!sqlite3_get_autocommit(db_))sqlite3_exec(db_,"ROLLBACK",nullptr,nullptr,nullptr);
+        throw;
+    }
+    for(const auto id:ids)claimed_.erase(id);
+    popped_+=ids.size();
 }
 std::optional<DurableLoss> DurableOutbox::claim_loss() {
     std::lock_guard lock(mutex_);auto reports=losses_locked();

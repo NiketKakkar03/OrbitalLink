@@ -23,5 +23,10 @@ struct orbit_sensor_clock { __s64 offset_ns; __u64 uncertainty_ns; };
 #define ORBIT_SENSOR_GET_CLOCK _IOR('S', 3, struct orbit_sensor_clock)
 /* Fresh comparison sample for drift evidence; does not change mapping. */
 #define ORBIT_SENSOR_CLOCK_CURRENT _IOR('S', 4, struct orbit_sensor_clock)
+struct orbit_sensor_events {
+	__u64 observations, coalesced, overflow;
+	__u32 pending, reserved;
+};
+#define ORBIT_SENSOR_GET_EVENTS _IOR('S', 6, struct orbit_sensor_events)
 /* SET_RATE takes abi_version=2, period_ms in1..60000, reserved zero. */
 #endif

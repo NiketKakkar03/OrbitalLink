@@ -26,6 +26,17 @@ int main() {
     }
     assert(counts[1]==120 && counts[2]==60 && counts[3]==300 && counts[4]==60 && counts[5]==60);
     assert(events==6);
+    // Health ticks end in 7. Exercise both sides of the 31-bit wrap for
+    // generated reports and uptime seconds without iterating billions of ticks.
+    orbit_scenario_record health{},boundary_event{};
+    orbit_scenario_tick(2'147'483'647ULL,42,&health,&boundary_event);
+    assert(health.category==4 && health.values[3]==2'147'483'647);
+    orbit_scenario_tick(2'147'483'657ULL,42,&health,&boundary_event);
+    assert(health.category==4 && health.values[3]==9);
+    orbit_scenario_tick(21'474'836'477ULL,42,&health,&boundary_event);
+    assert(health.category==4 && health.values[0]==2'147'483'647);
+    orbit_scenario_tick(21'474'836'487ULL,42,&health,&boundary_event);
+    assert(health.category==4 && health.values[0]==0);
     orbit_event_accumulator queue{};orbit_scenario_record warning{6,0,{4,2,2,1,0,0,0,0}},report{};
     for(int i=0;i<100;++i)assert(orbit_event_push(&queue,&warning));
     assert(queue.count==1 && queue.coalesced==99 && queue.observations==100 && queue.overflow==0);

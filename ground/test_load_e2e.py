@@ -80,13 +80,23 @@ def test_overload_with_slow_durable_receiver_is_explicit(tmp_path,certificates,t
         assert summary['durable_generated']==summary['durable_acknowledged']+summary['durable_dropped']+summary['durable_retained'],summary
         assert not summary['storage_failed'] and not errors,(summary,errors)
         initial=summary
-        # Exhausting a finite drain budget under overload is legitimate when
-        # the committed backlog remains intact. Verify its subsequent recovery.
-        if summary['durable_retained']:
-            recovery=command.copy();recovery[recovery.index('--count')+1]='0'
-            replay=subprocess.run(recovery,capture_output=True,text=True,timeout=15)
+        # Telemetry and loss reports have independent durable ACK boundaries.
+        # A finite drain may finish all samples while leaving loss reports to
+        # replay. Recover both within an explicit overall budget, retaining the
+        # service's supported three-second drain on each restarted connection.
+        recovery=command.copy();recovery[recovery.index('--count')+1]='0'
+        recovery[recovery.index('--io-timeout-ms')+1]='1500'
+        replays=[];recovery_started=time.monotonic();recovery_deadline=recovery_started+20
+        def needs_recovery(state):
+            return state['durable_retained']>0 or state['durable_dropped']!=state['durable_loss_acknowledged']
+        while needs_recovery(summary):
+            remaining=recovery_deadline-time.monotonic()
+            assert remaining>0 and len(replays)<8,('durable recovery budget exhausted',summary,replays,errors)
+            assert not errors,errors
+            replay=subprocess.run(recovery,capture_output=True,text=True,timeout=min(15,remaining))
             assert replay.returncode==0,replay.stderr
             summary=json.loads(replay.stdout)
+            replays.append(summary)
         assert not errors and not summary['storage_failed'] and summary['durable_retained']==0,(summary,errors)
         assert summary['durable_generated']==summary['durable_acknowledged']+summary['durable_dropped'],summary
         storage=TelemetryStorage(database)
@@ -95,7 +105,9 @@ def test_overload_with_slow_durable_receiver_is_explicit(tmp_path,certificates,t
             lost=sum(int(row[0],16) for row in storage.connection.execute('SELECT lost_count FROM loss_reports'))
             assert lost==summary['durable_dropped']==summary['durable_loss_acknowledged'],summary
         finally:storage.close()
-        (tmp_path/'result.json').write_text(json.dumps({'initial':initial,'final':summary},indent=2)+'\n')
+        with sqlite3.connect(outbox) as pending:
+            assert pending.execute('SELECT count(*) FROM loss').fetchone()[0]==0,summary
+        (tmp_path/'result.json').write_text(json.dumps({'initial':initial,'replays':replays,'final':summary,'recovery_elapsed_seconds':time.monotonic()-recovery_started},indent=2)+'\n')
     finally:
         stop.set();listener.close();worker.join(8)
     assert not worker.is_alive() and not errors,errors

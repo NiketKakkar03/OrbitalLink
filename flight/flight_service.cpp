@@ -355,10 +355,10 @@ void acquisition_loop(const Config& config, Shared& shared) {
                 if(!orbit_event_push(&pending_events,&reset_event))throw std::runtime_error("reset event accumulator full");
             }
             if(routine.category==4) {
-                routine.values[0]=static_cast<std::int32_t>((monotonic_ns()-shared.started_ns)/1000000000%2147483647U);
+                routine.values[0]=static_cast<std::int32_t>(((monotonic_ns()-shared.started_ns)/1'000'000'000ULL)&0x7fffffffULL);
                 routine.values[1]=static_cast<std::int32_t>(state.generation>=7?state.generation-7:0);
-                routine.values[3]=static_cast<std::int32_t>((sequence+1)%2147483647U);
-                routine.values[4]=static_cast<std::int32_t>(sequence%2147483647U);
+                routine.values[3]=static_cast<std::int32_t>((sequence+1)&0x7fffffffULL);
+                routine.values[4]=static_cast<std::int32_t>(sequence&0x7fffffffULL);
             }
             if(state.fault)routine.quality=1;
             retain_sample(orbit::scenario_sample(routine,config.boot_id,++sequence,device_sequence++,monotonic_ns(),state.generation),shared);

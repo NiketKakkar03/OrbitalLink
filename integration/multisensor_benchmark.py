@@ -40,6 +40,9 @@ def main():
     count=args.seconds*args.rate
     expected_events=sum(i%600 in (100,200,260,300,350,400) for i in range(count))
     expected=count+expected_events
+    profile=(3,1,3,2,3,1,3,4,3,5)
+    expected_categories=Counter(profile[i%10] for i in range(count))
+    if expected_events:expected_categories[6]=expected_events
     ready=output/'ready';database=output/'ground.db'
     try:
         with (output/'ground.log').open('wb') as glog,(output/'flight.log').open('wb') as flog,(output/'resources.jsonl').open('w') as resource_log:
@@ -78,17 +81,19 @@ def main():
             if summary.get(key)!=value:failures.append(f'{key}: {summary.get(key)} != {value}')
         if len(samples)!=expected:failures.append('ground row count mismatch')
         if len({(s.flight_boot_id,s.telemetry_sequence) for s in samples})!=expected:failures.append('identity mismatch')
-        if categories[6]!=expected_events or any(not categories[c] for c in range(1,6)):failures.append('missing categories/events')
+        if categories!=expected_categories:failures.append('category/event counts differ from declared profile')
         p95=summary.get('source_to_ack_p95_upper_ms')
         if p95 is None or p95>1000:failures.append('source-to-durableACK p95 exceeds1second or unavailable')
         if args.seconds>=600 and elapsed<args.seconds-1:failures.append('baseline did not sustain full requested duration')
         memory={}
         for name in ['flight','ground']:
             values=[r[name]['rss_bytes'] for r in resources if name in r]
+            if not values or (args.seconds>=600 and len(values)<args.seconds*.8):
+                failures.append(f'{name} resource sample coverage is incomplete')
             if values:
                 width=max(1,len(values)//4)
                 growth=sum(values[-width:])/width-sum(values[:width])/width
-                memory[name]={'peak_rss_bytes':max(values),'last_vs_first_quarter_mean_bytes':growth}
+                memory[name]={'rss_samples':len(values),'peak_rss_bytes':max(values),'last_vs_first_quarter_mean_bytes':growth}
                 if args.seconds>=600 and growth>32*1024*1024:failures.append(f'{name} RSS grows more than32MiB across profile')
         result={'status':'failed' if failures else 'passed','scope':'native scenario source; embedded device benchmark separate','requested_seconds':args.seconds,'elapsed_seconds':elapsed,'routine_rate':args.rate,'expected_rows':expected,'ground_rows':len(samples),'category_counts':dict(categories),'summary':summary,'memory':memory,'failures':failures,'host':platform.platform(),'execution_identity':identity}
         (output/'result.json').write_text(json.dumps(result,indent=2)+'\n')

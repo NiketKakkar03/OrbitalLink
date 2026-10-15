@@ -174,6 +174,11 @@ Guest boot and two-boot persistent replay passed: seven retained samples plus
 100 new samples reached durable ground storage over mutual TLS.
 The [driver test backend and flight adapter](docs/driver.md) passed the Linux
 syscall suite, 100 lifecycle cycles and a 100-sample driver-to-ground TLS gate.
-Custom QEMU MMIO/IRQ acquisition and the full embedded fault/benchmark suite
-remain separate completion gates. Native tests establish the host telemetry
-path only. See [the roadmap](OrbitalLink_Roadmap.md) for the dependent milestones.
+The `feature/multisensor-validation` branch adds a custom QEMU MMIO/IRQ hub and
+ABI2 driver, with power, thermal, orientation, health, synthetic radiation and
+event reports. Shared deterministic interactions include eclipse, heater changes
+and a pointing disturbance that pauses science collection. Legacy records remain
+supported. See [sensor validation](docs/sensor-validation.md) for the 10-minute
+baseline, separate native/embedded measurements, priority retention, bounded send
+window and remaining fault/release gates. Native results establish the host path;
+custom-device results require their own guest evidence.

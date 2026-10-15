@@ -10,7 +10,7 @@ and [MMIO/IRQ interface](../qemu/README.md).
 
 The baseline is **600 seconds**, ten routine reports/sec plus bounded events:
 power 2, thermal 1, orientation 5, health 1, science 1. The first full native run
-produced 6,060 records:1,200 power,600 thermal,3,000 orientation,600 health,600 science,
+produced 6,060 records: 1,200 power, 600 thermal, 3,000 orientation, 600 health, 600 science,
 60 events. Interactions include eclipse/power/heater changes, pointing disturbance
 and payload pause, low battery and electronics overheating. Values are synthetic;
 this is not a calibrated physical spacecraft model.
@@ -28,13 +28,14 @@ cannot change the executed artifact. Credentials stay in a private ignored
 subdirectory; do not publish that directory as a release artifact.
 
 Acceptance: exact durable sample identity/count reconciliation, all categories,
-all expected events, no source/outbox drops under the healthy baseline,95 th
-percentile source-to-durableACK <=1 second, complete latency sample coverage and
+all expected events, no source/outbox drops under the healthy baseline, 95th
+percentile source-to-durable-ACK <=1 second, complete latency sample coverage and
 bounded memory. Memory check compares first/last-quarter means with a 32 MiB bound;
 it is a finite-run guard, not proof that no leak can occur indefinitely.
 
-Record throughput in reports/sec and application bytes/sec separately. Frame
-bytes exclude TLS/TCP/IP overhead. ACK/source latency histograms use fixed 1 ms
+Record throughput in reports/sec and application bytes/sec separately. The
+`wire_application_bytes_sent` counter counts telemetry frames, including retries;
+it excludes control/ACK frames and TLS/TCP/IP overhead. ACK/source latency histograms use fixed 1 ms
 buckets; reported percentile is a conservative bucket bound. Samples beyond the
 histogram range are explicitly counted and an overflowing percentile is null.
 Replay from earlier boots is excluded from current-source latency calculations.
@@ -57,7 +58,7 @@ runs rather than retroactively attributed to that binary.
 |---|---|---|
 |600 seconds,10 routine Hz|`build/multisensor/baseline-600s-001/result.json`|6,060 stored;0 outbox drops;source-to-ACKp95<=13 ms;no measured memory growth|
 |30 seconds,100 routine Hz|`build/multisensor/performance-100hz-001/result.json`|3,030 stored;0 outbox drops;source-to-ACKp95<=27 ms|
-|Slow durable TLS receiver versus fast producer|`ground/test_load_e 2 e.py`|Capacity 32/window 8 stays bounded;intentional drops and their durable loss ACK counts reconcile|
+|Slow durable TLS receiver versus fast producer|`ground/test_load_e2e.py`|Capacity 32/window 8 stays bounded; intentional drops and their durable loss ACK counts reconcile; retained rows recover after the finite drain deadline|
 
 The 100 Hz result is a 30 second performance observation; it is not a 600 second
 100 Hz endurance gate. Baseline speed is 10 Hz. Device results must be reported
@@ -93,7 +94,7 @@ storage or link failure; all exhausted capacity must remain explicit.
 |Wire format/schema|Shared C++/Python 76-byte type 9 fixture, all categories, signed fields, reserved slots, bad schema/quality/bools, fragmented input|
 |Old databases|SQLite migration, legacy fixtures/status preserved, typed metadata roundtrip|
 |Window/reordering|Real C++ process sends 4 before first ACK; reverse-order receipts; exact identity matching|
-|Connection faults|Disconnect replay and unknown-ACK rejection; legacy outage and lost telemetry/loss ACK tests retained|
+|Connection faults|Disconnect replay, unknown/duplicate ACK rejection and valid-prefix commit with storage batches 1 and 16; legacy outage and lost telemetry/loss ACK tests retained|
 |Priority/capacity|Weighted fairness, reserved urgent capacity, all-claimed protection, overload admission, mode-reopen atomic rollback|
 |Source contracts|ABI2 whole 64-byte reads, invalid category 0, malformed/partial records, counter equations, supported real rate effects|
 |Scenario interactions|Repeatable category mix, eclipse/power/thermal, orientation/payload pause, bounded repeated-event reports|

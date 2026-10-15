@@ -16,6 +16,20 @@ from integration.run_checks import stop_process_group
 from run_gate import run_smoke
 
 
+def validate_memory(resource_text, duration, summary):
+    rss = [int(line.split()[1])*1024 for line in resource_text.splitlines() if line.startswith('VmRSS:')]
+    required = max(1,int(duration / 10 * 0.8))
+    if len(rss) < required:
+        raise RuntimeError(f'guest RSS coverage insufficient: {len(rss)}<{required}')
+    width = max(1,len(rss)//4)
+    growth = sum(rss[-width:])/width-sum(rss[:width])/width
+    if growth > 32*1024*1024:
+        raise RuntimeError(f'guest RSS growth exceeded declared32MiB bound: {growth}')
+    return {'rss_samples':len(rss),'required_samples':required,'sample_interval_seconds':10,
+        'peak_sampled_rss_bytes':max(rss),'last_vs_first_quarter_mean_bytes':growth,
+        'growth_limit_bytes':32*1024*1024,'process_peak_rss_bytes':summary['process_peak_rss_bytes']}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--work', type=Path, required=True)
@@ -88,7 +102,10 @@ def main():
                 phase = tick % 600
                 if phase in event_codes:
                     event = ordered[cursor]; cursor += 1
-                    if event.category != 6 or event.values[0] != event_codes[phase] or event.values[3] != 1 or any(event.values[4:]):
+                    code = event_codes[phase]
+                    severity = {1:0,2:0,3:2,4:2,5:1,6:0}[code]
+                    related = {1:1,2:1,3:1,4:2,5:3,6:3}[code]
+                    if event.category != 6 or tuple(event.values[:4]) != (code,severity,related,1) or any(event.values[4:]):
                         raise RuntimeError('transition event/ordering differs from declared scenario')
                 sample = ordered[cursor]; cursor += 1
                 if sample.category != profile[tick % 10]:
@@ -128,12 +145,7 @@ def main():
             if clock_drift > clock_budget:
                 raise RuntimeError(f'guest/device clock drift exceeds brackets plus declared1ms tolerance: {clock_drift}>{clock_budget}')
             guest_resource_text = (output / 'baseline/guest-flight-resources.txt').read_text()
-            rss = [int(line.split()[1])*1024 for line in guest_resource_text.splitlines() if line.startswith('VmRSS:')]
-            width = max(1,len(rss)//4)
-            guest_memory = {'rss_samples':len(rss),'sample_interval_seconds':10,
-                'peak_sampled_rss_bytes':max(rss) if rss else None,
-                'last_vs_first_quarter_mean_bytes':sum(rss[-width:])/width-sum(rss[:width])/width if rss else None,
-                'process_peak_rss_bytes':summary['process_peak_rss_bytes']}
+            guest_memory = validate_memory(guest_resource_text,duration,summary)
             result = {'status':'passed','gate':'actual QEMU multisensor MMIO/IRQ to mTLS durable ground storage',
                 'routine_ticks':args.ticks,'period_ms':args.period_ms,'scenario_seed':args.seed,
                 'storage_batch':args.storage_batch,

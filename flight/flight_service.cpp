@@ -2,6 +2,7 @@
 #include "gap_tracker.hpp"
 #include "retention_queue.hpp"
 #include "durable_outbox.hpp"
+#include "device_source.hpp"
 #include "retry_policy.hpp"
 #include "command_policy.hpp"
 
@@ -60,6 +61,8 @@ struct Config {
     std::string ca, certificate, key, server_name, authorized_command_server;
     std::string host;
     std::string outbox_path;
+    std::string source{"fake"};
+    std::string device_path{"/dev/orbit_telemetry"};
     std::uint64_t outbox_bytes{64*1024*1024};
     std::uint16_t port{};
     std::uint64_t count{100};
@@ -103,8 +106,17 @@ struct Counters {
 struct Shared {
     explicit Shared(const Config& config) : retained(config.capacity), gaps(16) {
         if(!config.outbox_path.empty()) durable=std::make_unique<orbit::DurableOutbox>(config.outbox_path,config.outbox_bytes,config.capacity);
+        if(config.source=="device") {
+            device=std::make_unique<orbit::DeviceSource>(orbit::open_device(config.device_path));
+            commands.device_backend([this](const orbit::CommandRequest& request) {
+                if(request.opcode!=3)return orbit::CommandStatus::invalid_argument;
+                return device->set_rate(request.argument)?orbit::CommandStatus::applied:orbit::CommandStatus::outcome_unknown;
+            });
+        }
     }
     std::unique_ptr<orbit::DurableOutbox> durable;
+    std::unique_ptr<orbit::DeviceSource> device;
+    orbit_stats driver_stats{};
     std::atomic<bool> storage_failed{false};
     orbit::RetentionQueueSnapshot retention_snapshot() const { return durable?durable->snapshot():retained.snapshot(); }
     orbit::RetentionQueue<orbit::TelemetrySample> retained;
@@ -184,6 +196,8 @@ Config parse_args(int argc, char** argv) {
     for (int i = 3; i < argc; i += 2) {
         if (i + 1 >= argc) throw std::invalid_argument(std::string("missing value for ") + argv[i]);
         const std::string option = argv[i];
+        if (option == "--source") { config.source=argv[i+1]; continue; }
+        if (option == "--device") { config.device_path=argv[i+1]; continue; }
         if (option == "--outbox") { config.outbox_path=argv[i+1]; continue; }
         if (option == "--authorized-command-server") { config.authorized_command_server=argv[i+1]; continue; }
         if (option == "--ca") { config.ca = argv[i + 1]; continue; }
@@ -209,6 +223,9 @@ Config parse_args(int argc, char** argv) {
         }
         else throw std::invalid_argument("unknown option: " + option);
     }
+    if(config.source!="fake" && config.source!="device")throw std::invalid_argument("source must be fake or device");
+    if(config.source=="device" && (config.interval_ms<1 || config.interval_ms>60000 || config.fake_fault))
+        throw std::invalid_argument("device source requires period1..60000ms and does not support fake-fault");
     if (config.capacity == 0) throw std::invalid_argument("capacity must be positive");
     if (config.max_frames_per_iteration == 0)
         throw std::invalid_argument("max-frames-per-iteration must be positive");
@@ -243,8 +260,37 @@ orbit::TelemetrySample make_sample(std::uint64_t index, std::uint64_t boot_id) {
     };
 }
 
+void retain_sample(const orbit::TelemetrySample& sample, Shared& shared) {
+        shared.counters.generated.fetch_add(1);
+        if(shared.durable) {
+            const auto displaced=shared.durable->push(sample);
+            shared.counters.dropped_oldest.fetch_add(displaced.size());
+            for(const auto& lost:displaced) shared.gaps.record_dropped(lost.telemetry_sequence);
+        } else {
+            const auto displaced=shared.retained.push(sample);
+            if(displaced) {shared.counters.dropped_oldest.fetch_add(1);shared.gaps.record_dropped(displaced->telemetry_sequence);}
+        }
+}
+
 void acquisition_loop(const Config& config, Shared& shared) {
     shared.commands.configure(static_cast<std::uint32_t>(config.interval_ms), config.fake_fault);
+    if(shared.device) {
+        if(!shared.device->set_rate(static_cast<std::uint32_t>(config.interval_ms)))
+            throw std::runtime_error("initial device SET_RATE failed");
+        shared.driver_stats=shared.device->stats();
+        std::uint64_t acquired=0;
+        while(acquired<config.count && !shared.stop_requested.load()) {
+            shared.commands.execute(monotonic_ns());
+            const auto records=shared.device->read(static_cast<std::size_t>(std::min<std::uint64_t>(16,config.count-acquired)));
+            for(const auto& record:records)retain_sample(orbit::DeviceSource::telemetry(record,config.boot_id,++acquired),shared);
+            shared.driver_stats=shared.device->stats();
+        }
+        shared.acquisition_done.store(true);
+        while(!shared.network_done.load() && !shared.stop_requested.load()) {
+            shared.commands.execute(monotonic_ns());std::this_thread::sleep_for(Milliseconds(1));
+        }
+        return;
+    }
     auto next = Clock::now();
     std::uint32_t device_sequence=0, generation=7;
     std::uint64_t index=0;
@@ -257,15 +303,7 @@ void acquisition_loop(const Config& config, Shared& shared) {
         sample.device_generation=generation; sample.device_sequence=device_sequence++;
         sample.timestamp_monotonic_ns=monotonic_ns();
         if(device.fault) sample.temperature_millideg_c=200000;
-        shared.counters.generated.fetch_add(1);
-        if(shared.durable) {
-            const auto displaced=shared.durable->push(sample);
-            shared.counters.dropped_oldest.fetch_add(displaced.size());
-            for(const auto& lost:displaced) shared.gaps.record_dropped(lost.telemetry_sequence);
-        } else {
-            const auto displaced=shared.retained.push(sample);
-            if(displaced) {shared.counters.dropped_oldest.fetch_add(1);shared.gaps.record_dropped(displaced->telemetry_sequence);}
-        }
+        retain_sample(sample,shared);
         next=Clock::now()+Milliseconds(device.period_ms);
     }
     shared.acquisition_done.store(true);
@@ -697,10 +735,20 @@ void print_summary(const Shared& shared) {
               << ",\"gap_omitted_dropped\":" << gaps.omitted_dropped
               << ",\"gap_detail_complete\":" << (gaps.detail_complete ? "true" : "false")
               << ",\"command_effects\":" << device.effects
-              << ",\"device_enabled\":" << (device.enabled ? "true" : "false")
-              << ",\"device_period_ms\":" << device.period_ms
-              << ",\"device_generation\":" << device.generation
-              << ",\"device_fault\":" << (device.fault ? "true" : "false")
+              << ",\"source\":\"" << (shared.device?"device":"fake") << "\"";
+    if(shared.device) {
+        std::cout << ",\"driver_generated\":" << shared.driver_stats.generated
+                  << ",\"driver_enqueued\":" << shared.driver_stats.enqueued
+                  << ",\"driver_dropped\":" << shared.driver_stats.dropped
+                  << ",\"driver_delivered\":" << shared.driver_stats.delivered
+                  << ",\"driver_queued\":" << shared.driver_stats.queued;
+    } else {
+        std::cout << ",\"device_enabled\":" << (device.enabled ? "true" : "false")
+                  << ",\"device_period_ms\":" << device.period_ms
+                  << ",\"device_generation\":" << device.generation
+                  << ",\"device_fault\":" << (device.fault ? "true" : "false");
+    }
+    std::cout
               << ",\"storage_failed\":" << (shared.storage_failed.load() ? "true" : "false")
               << ",\"durable\":" << (shared.durable ? "true" : "false")
               << ",\"retention_capacity\":" << retained.capacity
@@ -747,7 +795,12 @@ int main(int argc, char** argv) {
         std::thread network([&]{guarded(network_loop);});
         if (config.ready_fd >= 0) {
             const char ready = 'R';
-            (void)::write(config.ready_fd, &ready, 1);
+            ssize_t notified;
+            do { notified=::write(config.ready_fd, &ready, 1); } while(notified<0 && errno==EINTR);
+            if(notified!=1) {
+                std::cerr<<"flight_service: ready notification failed\n";
+                shared.storage_failed.store(true);shared.stop_requested.store(true);
+            }
             (void)::close(config.ready_fd);
         }
         acquisition.join();

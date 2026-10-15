@@ -1,0 +1,28 @@
+{
+  "schema": 1,
+  "buildroot": {
+    "release": "2025.02.18",
+    "repository": "https://github.com/buildroot/buildroot.git",
+    "commit": "d030e36bbc9669230c015be971b14b6e062cfdde"
+  },
+  "linux": {
+    "version": "6.12.27",
+    "sha256": "8f4655a4cc7f93d72f515bbca54756de26ddaf5949790da6a17f766e3c33dc79"
+  },
+  "qemu": {
+    "version": "9.2.0",
+    "machine": "virt-9.2",
+    "sha256": "f859f0bc65e1f533d040bbe8c92bcfecee5af2c921a6687c652fb44d089bd894"
+  },
+  "toolchain": {
+    "gcc": "13.4.0",
+    "libc": "glibc",
+    "triplet": "aarch64-buildroot-linux-gnu"
+  },
+  "sources_verified": "2026-10-14",
+  "status": "development pins; build and boot gate pending",
+  "audit_sources": [
+    "https://buildroot.org/download.html",
+    "https://github.com/buildroot/buildroot/tree/d030e36bbc9669230c015be971b14b6e062cfdde"
+  ]
+}

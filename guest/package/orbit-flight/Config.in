@@ -1,0 +1,8 @@
+config BR2_PACKAGE_ORBIT_FLIGHT
+	bool "OrbitalLink flight service"
+	depends on BR2_INSTALL_LIBSTDCPP
+	depends on BR2_TOOLCHAIN_HAS_THREADS
+	select BR2_PACKAGE_OPENSSL
+	help
+	  Build the fake-source service using the same target toolchain and
+	  OpenSSL sysroot as the ARM64 image. No credentials are installed.

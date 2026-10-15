@@ -3,6 +3,7 @@
 #include <deque>
 #include <mutex>
 #include <optional>
+#include <functional>
 
 namespace orbit {
 struct CommandRequest {
@@ -25,6 +26,7 @@ class CommandDispatcher {
     std::deque<CommandRequest> work_;
     std::deque<CommandResult> results_;
     FakeDeviceState state_;
+    std::function<CommandStatus(const CommandRequest&)> device_execute_;
   public:
     void open(std::uint64_t session) {
         std::lock_guard lock(mutex_);
@@ -39,12 +41,16 @@ class CommandDispatcher {
         if (request.opcode < 1 || request.opcode > 6 ||
             (request.opcode == 3 ? (request.argument < 1 || request.argument > 60'000) : request.argument != 0))
             return CommandStatus::invalid_argument;
+        if(device_execute_ && request.opcode!=3)return CommandStatus::invalid_argument;
         if (work_.size()+results_.size() >= 16) return CommandStatus::queue_full;
         last_sequence_=request.sequence;
         work_.push_back(request);
         return CommandStatus::applied; // accepted; wire completion waits for execute()
     }
     void configure(std::uint32_t period, bool fault=false) { std::lock_guard lock(mutex_); state_.period_ms=period; state_.fault=fault; }
+    void device_backend(std::function<CommandStatus(const CommandRequest&)> execute) {
+        std::lock_guard lock(mutex_);device_execute_=std::move(execute);
+    }
     void close() { open(0); }
     void execute(std::uint64_t now) {
         std::lock_guard lock(mutex_);
@@ -52,6 +58,10 @@ class CommandDispatcher {
             auto request=work_.front(); work_.pop_front();
             auto status=CommandStatus::applied;
             if (request.deadline_ns <= now) status=CommandStatus::expired;
+            else if(device_execute_) {
+                status=device_execute_(request);
+                if(status==CommandStatus::applied)state_.period_ms=request.argument;
+            }
             else switch (request.opcode) {
                 case 1: state_.enabled=true; break;
                 case 2: state_.enabled=false; break;

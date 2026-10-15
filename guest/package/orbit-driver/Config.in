@@ -1,0 +1,5 @@
+config BR2_PACKAGE_ORBIT_DRIVER
+	bool "OrbitalLink test driver and syscall harness"
+	depends on BR2_LINUX_KERNEL
+	help
+	  Disposable-guest test backend, not the M7 MMIO peripheral driver.

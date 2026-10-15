@@ -1,0 +1,2 @@
+source "$BR2_EXTERNAL_ORBIT_PATH/package/orbit-flight/Config.in"
+source "$BR2_EXTERNAL_ORBIT_PATH/package/orbit-driver/Config.in"

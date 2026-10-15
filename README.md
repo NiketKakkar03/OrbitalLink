@@ -153,7 +153,9 @@ Connection retries begin at 250 ms, double to a five-second cap, include bounded
 jitter, and reset after a successful ACK. Socket operations use nonblocking I/O
 and deadlines. SIGINT or SIGTERM stops acquisition, attempts a bounded drain,
 accounts for every remaining sample, closes descriptors, and joins both threads
-within the three-second external shutdown contract.
+within the three-second external shutdown contract on responsive storage.
+Uninterruptible filesystem I/O can delay a durable-service shutdown; the native
+network tests do not establish a hard deadline under failing storage hardware.
 
 Committed telemetry and loss reports survive a flight-process restart. An
 indefinite outage still exceeds finite storage: old queued samples are dropped

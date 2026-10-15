@@ -7,7 +7,7 @@ PYTHON ?= $(shell if [ -x .venv/bin/python ]; then printf '.venv/bin/python'; el
 
 .PHONY: check test-python test-cpp test-native-e2e test-recovery test-security test-sanitizers test-tsan clean
 
-check: test-python test-cpp test-native-e2e test-recovery test-durable test-security test-harness
+check: test-python test-cpp test-native-e2e test-recovery test-durable test-security test-harness test-foundations
 
 .PHONY: test-durable
 test-durable:
@@ -32,6 +32,8 @@ test-recovery:
 	$(PYTHON) -m pytest ground/test_m3_e2e.py
 
 test-cpp:
+	$(CXX) $(CXXFLAGS) -pthread  flight/tests/test_device_source.cpp -o /tmp/orbit_device_source_test
+	/tmp/orbit_device_source_test
 	$(CXX) $(CXXFLAGS) -pthread flight/durable_outbox_tests.cpp flight/durable_outbox.cpp -o /tmp/orbit_durable_outbox_test -lsqlite3
 	/tmp/orbit_durable_outbox_test
 	$(CXX) $(CXXFLAGS) -pthread flight/tests/test_command_policy.cpp -o /tmp/orbit_command_policy_test
@@ -46,6 +48,8 @@ test-cpp:
 	$(CXX) $(CXXFLAGS) $(TLS_CXXFLAGS) -pthread flight/flight_service.cpp flight/durable_outbox.cpp -o /tmp/orbit_flight_service $(TLS_LDLIBS)
 
 test-sanitizers:
+	$(CXX) $(CXXFLAGS) -pthread -fsanitize=address,undefined flight/tests/test_device_source.cpp -o /tmp/orbit_device_source_sanitized
+	/tmp/orbit_device_source_sanitized
 	$(CXX) $(CXXFLAGS) -pthread -fsanitize=address,undefined flight/durable_outbox_tests.cpp flight/durable_outbox.cpp -o /tmp/orbit_durable_outbox_sanitized -lsqlite3
 	/tmp/orbit_durable_outbox_sanitized
 	$(CXX) $(CXXFLAGS) -pthread -fsanitize=address,undefined \
@@ -60,6 +64,8 @@ test-sanitizers:
 		--interval-ms 0 --capacity 32 --connect-timeout-ms 10 --io-timeout-ms 10 --drain-ms 25
 
 test-tsan:
+	$(CXX) $(CXXFLAGS) -pthread -fsanitize=thread flight/tests/test_device_source.cpp -o /tmp/orbit_device_source_tsan
+	/tmp/orbit_device_source_tsan
 	$(CXX) $(CXXFLAGS) -pthread -fsanitize=thread flight/durable_outbox_tests.cpp flight/durable_outbox.cpp -o /tmp/orbit_durable_outbox_tsan -lsqlite3
 	/tmp/orbit_durable_outbox_tsan
 	$(CXX) $(CXXFLAGS) -pthread -fsanitize=thread \
@@ -89,3 +95,8 @@ demo-native: test-cpp
 
 test-harness:
 	$(PYTHON) -m pytest integration/test_run_checks.py
+
+.PHONY: test-foundations
+test-foundations:
+	$(PYTHON) -m pytest guest/tests/test_recipe.py
+	$(MAKE) -C driver host-check

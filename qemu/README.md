@@ -76,7 +76,9 @@ loss. A new binding therefore cannot silently reset a counter epoch. ABI2
 600 ticks/606 records, category mix, events, coherent latch, overflow, reset,
 rate limits, counter snapshot, and stop control. Linux
 `driver/tests/sensors_contract.c` separately tests real IRQ-driven acquisition,
-ABI2 read/ioctl behavior, the complete scenario mix and reset generation.
+ABI2 read/ioctl behavior, enable/disable/rate/reset/clear-fault and truthful state
+queries, the complete scenario mix and reset generation. The matching
+device-tree schema is `driver/bindings/orbital,multisensor-v2.yaml`.
 Presence of test code is not a pass: retain the actual test result artifacts.
 
 Live VM migration/snapshots of the hub are not implemented. The supported

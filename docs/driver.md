@@ -65,13 +65,13 @@ records and preserves device sequence/generation/time/value fields. It fails on
 detach or invalid records rather than silently switching sources. The default
 source remains the fake device for native demonstrations.
 
-The current test driver supports rate changes and counter queries. Device-mode
-flight accepts only the rate command, and reports success after the ioctl
-succeeds. Enable, disable, reset, clear-fault and live state-query commands are
-rejected until real driver controls/state are implemented. Driver FIFO loss
+The legacy ABI1 test driver supports rate changes and counter queries. Its
+device mode continues to reject unsupported controls. The ABI2 multisensor
+driver accepts the full control set and reports success only after the ioctl
+succeeds and the actual state is read back. Driver FIFO loss
 counters are separate from the durable outbox's acknowledged loss reports.
 Device-to-ground validation passed for this test backend. Wider fault injection,
-benchmarking and real MMIO/IRQ acquisition remain later gates.
+benchmarking remain later gates.
 
 The first device telemetry run reported 177 generated records: 164 enqueued plus
 13 drop-newest losses. Of the enqueued records, 100 were delivered to flight and

@@ -87,7 +87,7 @@ The security tests exercise certificate validity on both peers, foreign-CA
 clients, explicit credential requirements, plaintext rejection and cancellation
 of stalled TLS handshakes. Command tests use real mutual TLS between Python and
 the C++ service, including the protected local operator CLI and SQLite result
-persistence. The device adapter implements real set-period through ioctl; unsupported device
-controls and query-state are rejected. The M6 syscall/lifecycle and device-origin
-telemetry gates passed, while end-to-end embedded command fault validation and
-the custom QEMU backend remain later gates.
+persistence. The ABI2 sensor adapter implements the full command set through
+ioctl and reads the resulting hardware state before reporting success. The
+syscall/lifecycle, device-origin telemetry and custom QEMU backend gates passed;
+the broader embedded fault matrix remains later work.

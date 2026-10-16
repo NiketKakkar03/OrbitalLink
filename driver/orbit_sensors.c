@@ -28,6 +28,7 @@ struct sensor_device {
 	struct orbit_sensor_sample fifo[ORBIT_SENSOR_FIFO_CAPACITY];
 	u32 head, count;
 	u64 delivered, dropped;
+	u64 command_effects;
 	s64 clock_offset_ns;
 	u64 clock_uncertainty_ns;
 	bool opened, dead;
@@ -184,11 +185,14 @@ static long sensor_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	struct orbit_stats stats = {.abi_version = 2, .capacity = 320};
 	struct orbit_sensor_clock clock = {0};
 	struct orbit_sensor_events events = {0};
+	struct orbit_sensor_state state = {.abi_version = 2};
 	unsigned long flags;
 	u64 hardware_dropped;
 	int ret;
 	if (cmd != ORBIT_SENSOR_GET_STATS && cmd != ORBIT_SENSOR_SET_RATE && cmd != ORBIT_SENSOR_RESET &&
-	    cmd != ORBIT_SENSOR_GET_CLOCK && cmd != ORBIT_SENSOR_CLOCK_CURRENT && cmd != ORBIT_SENSOR_GET_EVENTS)
+	    cmd != ORBIT_SENSOR_GET_CLOCK && cmd != ORBIT_SENSOR_CLOCK_CURRENT && cmd != ORBIT_SENSOR_GET_EVENTS &&
+	    cmd != ORBIT_SENSOR_ENABLE && cmd != ORBIT_SENSOR_DISABLE && cmd != ORBIT_SENSOR_CLEAR_FAULT &&
+	    cmd != ORBIT_SENSOR_GET_STATE)
 		return -ENOTTY;
 	if (cmd == ORBIT_SENSOR_SET_RATE) {
 		if (copy_from_user(&rate, (void __user *)arg, sizeof(rate))) return -EFAULT;
@@ -223,23 +227,42 @@ static long sensor_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		clock.uncertainty_ns = (after - before + 1) / 2;
 	} else if (cmd == ORBIT_SENSOR_SET_RATE) {
 		writel(rate.period_ms, d->base + 0x10);
+		d->command_effects++;
 	} else if (cmd == ORBIT_SENSOR_GET_EVENTS) {
 		writel(1, d->base + 0x80);
 		events.observations = ((u64)readl(d->base + 0x124) << 32) | readl(d->base + 0x120);
 		events.coalesced = ((u64)readl(d->base + 0x12c) << 32) | readl(d->base + 0x128);
 		events.overflow = ((u64)readl(d->base + 0x134) << 32) | readl(d->base + 0x130);
 		events.pending = readl(d->base + 0x138);
+	} else if (cmd == ORBIT_SENSOR_GET_STATE) {
+		state.enabled = !!(readl(d->base + 0x08) & 1);
+		state.period_ms = readl(d->base + 0x10);
+		state.generation = readl(d->base + 0x28);
+		state.reset_count = readl(d->base + 0x2c);
+		state.fault_category = readl(d->base + 0xd0);
+		state.command_effects = d->command_effects;
+	} else if (cmd == ORBIT_SENSOR_ENABLE) {
+		writel(readl(d->base + 0x08) | 3, d->base + 0x08);
+		d->command_effects++;
+	} else if (cmd == ORBIT_SENSOR_DISABLE) {
+		writel(readl(d->base + 0x08) & ~1U, d->base + 0x08);
+		d->command_effects++;
+	} else if (cmd == ORBIT_SENSOR_CLEAR_FAULT) {
+		writel(0, d->base + 0xd0);
+		d->command_effects++;
 	} else {
 		d->dropped += d->count;
 		writel(d->count, d->base + 0xf4);
 		d->head = d->count = 0;
 		writel(1, d->base + 0x18);
+		d->command_effects++;
 	}
 	spin_unlock_irqrestore(&d->lock, flags);
 	if (!ret && cmd == ORBIT_SENSOR_GET_STATS && copy_to_user((void __user *)arg, &stats, sizeof(stats))) ret = -EFAULT;
 	if (!ret && (cmd == ORBIT_SENSOR_GET_CLOCK || cmd == ORBIT_SENSOR_CLOCK_CURRENT) &&
 	    copy_to_user((void __user *)arg, &clock, sizeof(clock))) ret = -EFAULT;
 	if (!ret && cmd == ORBIT_SENSOR_GET_EVENTS && copy_to_user((void __user *)arg, &events, sizeof(events))) ret = -EFAULT;
+	if (!ret && cmd == ORBIT_SENSOR_GET_STATE && copy_to_user((void __user *)arg, &state, sizeof(state))) ret = -EFAULT;
 	mutex_unlock(&d->io);
 	return ret;
 }

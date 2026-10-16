@@ -23,6 +23,19 @@ int main() {
         assert(result->snapshot->effects==0 && query.state().effects==0);
     }
 
+    {
+        orbit::CommandDispatcher device; device.open(45);
+        device.device_backend([](const orbit::CommandRequest&) {
+            return orbit::DeviceCommandOutcome{orbit::CommandStatus::applied,
+                orbit::FakeDeviceState{false,25,9,true,12}};
+        });
+        assert(device.submit({45,1,9,1000,6,0},true,0)==orbit::CommandStatus::applied);
+        device.execute(1);auto result=device.pop_result();
+        assert(result && result->snapshot && !result->snapshot->enabled);
+        assert(result->snapshot->period_ms==25 && result->snapshot->generation==9);
+        assert(result->snapshot->fault && result->snapshot->effects==12);
+    }
+
     orbit::CommandDispatcher dispatch;
     dispatch.open(42);
     orbit::CommandRequest request{42,1,100,1000,3,250};

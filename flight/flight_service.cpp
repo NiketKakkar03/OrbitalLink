@@ -120,15 +120,30 @@ struct Shared {
             sensors=std::make_unique<orbit::SensorSource>(orbit::open_sensor_device(config.device_path));
             sensor_clock_initial=sensors->clock_info();
             commands.device_backend([this](const orbit::CommandRequest& request) {
-                if(request.opcode!=3)return orbit::CommandStatus::invalid_argument;
-                return sensors->set_rate(request.argument)?orbit::CommandStatus::applied:orbit::CommandStatus::outcome_unknown;
+                bool applied=false;
+                switch(request.opcode) {
+                    case 1: applied=sensors->enable();break;
+                    case 2: applied=sensors->disable();break;
+                    case 3: applied=sensors->set_rate(request.argument);break;
+                    case 4: applied=sensors->reset();break;
+                    case 5: applied=sensors->clear_fault();break;
+                    case 6: applied=true;break;
+                    default:return orbit::DeviceCommandOutcome{orbit::CommandStatus::invalid_argument,{}};
+                }
+                if(!applied)return orbit::DeviceCommandOutcome{orbit::CommandStatus::outcome_unknown,{}};
+                try {
+                    const auto actual=sensors->state();
+                    return orbit::DeviceCommandOutcome{orbit::CommandStatus::applied,
+                        orbit::FakeDeviceState{!!actual.enabled,actual.period_ms,actual.generation,
+                            actual.fault_category!=0,actual.command_effects}};
+                } catch(...) {return orbit::DeviceCommandOutcome{orbit::CommandStatus::outcome_unknown,{}};}
             });
         }
         if(config.source=="device") {
             device=std::make_unique<orbit::DeviceSource>(orbit::open_device(config.device_path));
             commands.device_backend([this](const orbit::CommandRequest& request) {
-                if(request.opcode!=3)return orbit::CommandStatus::invalid_argument;
-                return device->set_rate(request.argument)?orbit::CommandStatus::applied:orbit::CommandStatus::outcome_unknown;
+                if(request.opcode!=3)return orbit::DeviceCommandOutcome{orbit::CommandStatus::invalid_argument,{}};
+                return orbit::DeviceCommandOutcome{device->set_rate(request.argument)?orbit::CommandStatus::applied:orbit::CommandStatus::outcome_unknown,{}};
             });
         }
     }

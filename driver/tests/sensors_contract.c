@@ -24,6 +24,7 @@ int main(void)
 	struct orbit_stats before, after;
 	struct orbit_sensor_clock clock;
 	struct orbit_sensor_events events;
+	struct orbit_sensor_state state;
 	struct orbit_rate rate = {.abi_version = 2, .period_ms = 10};
 	unsigned counts[7] = {0}, total = 0;
 	uint64_t last_ns = 0;
@@ -35,7 +36,17 @@ int main(void)
 	assert(open("/dev/orbit_sensors", O_RDONLY) == -1 && errno == EBUSY);
 	assert(read(fd, samples, 1) == -1 && errno == EINVAL);
 	assert(ioctl(fd, ORBIT_IOC_GET_STATS, &before) == -1 && errno == ENOTTY);
+	assert(ioctl(fd, _IO('S', 99), 0) == -1 && errno == ENOTTY);
 	assert(ioctl(fd, ORBIT_SENSOR_SET_RATE, &rate) == 0);
+	assert(ioctl(fd, ORBIT_SENSOR_GET_STATE, &state) == 0);
+	assert(state.abi_version == 2 && state.enabled == 1 && state.period_ms == 10 && state.generation == 1);
+	assert(state.fault_category == 0 && state.command_effects == 1 && !state.reserved[0] && !state.reserved[1]);
+	assert(ioctl(fd, ORBIT_SENSOR_DISABLE) == 0);
+	assert(ioctl(fd, ORBIT_SENSOR_GET_STATE, &state) == 0 && state.enabled == 0 && state.command_effects == 2);
+	assert(ioctl(fd, ORBIT_SENSOR_ENABLE) == 0);
+	assert(ioctl(fd, ORBIT_SENSOR_GET_STATE, &state) == 0 && state.enabled == 1 && state.command_effects == 3);
+	assert(ioctl(fd, ORBIT_SENSOR_CLEAR_FAULT) == 0);
+	assert(ioctl(fd, ORBIT_SENSOR_GET_STATE, &state) == 0 && state.fault_category == 0 && state.command_effects == 4);
 	assert(ioctl(fd, ORBIT_SENSOR_GET_CLOCK, &clock) == 0);
 	assert(clock.uncertainty_ns < 1000000000ULL);
 	while (total < 606) {
@@ -65,8 +76,10 @@ int main(void)
 	void *bad = mmap(NULL, 4096, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 	assert(bad != MAP_FAILED);
 	assert(ioctl(fd, ORBIT_SENSOR_GET_STATS, bad) == -1 && errno == EFAULT);
+	assert(ioctl(fd, ORBIT_SENSOR_GET_STATE, bad) == -1 && errno == EFAULT);
 	assert(munmap(bad, 4096) == 0);
 	assert(ioctl(fd, ORBIT_SENSOR_RESET) == 0);
+	assert(ioctl(fd, ORBIT_SENSOR_GET_STATE, &state) == 0 && state.generation == 2 && state.reset_count == 1 && state.command_effects == 6);
 	struct pollfd p = {.fd = fd, .events = POLLIN};
 	assert(poll(&p, 1, 2000) == 1);
 	bad = mmap(NULL, 4096, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -106,6 +119,6 @@ int main(void)
 	stats(fd, &after);
 	assert(after.delivered == before.delivered && after.generated >= before.generated && after.dropped > before.dropped);
 	assert(close(fd) == 0);
-	puts("PASS: ABI2 MMIO/IRQ, profile, counters, reset, usercopy fault, unbind/rebind accounting");
+	puts("PASS: ABI2 MMIO/IRQ, profile, controls/state, counters, reset, usercopy fault, unbind/rebind accounting");
 	return 0;
 }

@@ -28,5 +28,14 @@ struct orbit_sensor_events {
 	__u32 pending, reserved;
 };
 #define ORBIT_SENSOR_GET_EVENTS _IOR('S', 6, struct orbit_sensor_events)
+struct orbit_sensor_state {
+	__u32 abi_version, enabled, period_ms, generation;
+	__u32 fault_category, reset_count, reserved[2];
+	__u64 command_effects;
+};
+#define ORBIT_SENSOR_ENABLE _IO('S', 7)
+#define ORBIT_SENSOR_DISABLE _IO('S', 8)
+#define ORBIT_SENSOR_CLEAR_FAULT _IO('S', 9)
+#define ORBIT_SENSOR_GET_STATE _IOR('S', 10, struct orbit_sensor_state)
 /* SET_RATE takes abi_version=2, period_ms in1..60000, reserved zero. */
 #endif

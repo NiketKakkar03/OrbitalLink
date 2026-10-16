@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -34,6 +35,8 @@ public:
     virtual std::ptrdiff_t read_records(void* destination,std::size_t bytes)=0;
     virtual orbit_stats stats()=0;
     virtual bool set_rate(const orbit_rate& rate)=0;
+    virtual bool control(unsigned long command) {(void)command;return false;}
+    virtual std::optional<orbit_sensor_state> sensor_state() {return {};}
     virtual orbit_sensor_events events_info() {return {};}
     virtual orbit_sensor_clock clock_info(bool current=false) {(void)current;return {};}
 };
@@ -85,6 +88,15 @@ public:
     }
     bool set_rate(const orbit_rate& rate) override {
         return ::ioctl(fd_,sensors_?ORBIT_SENSOR_SET_RATE:ORBIT_IOC_SET_RATE,&rate)==0;
+    }
+    bool control(unsigned long command) override {
+        return sensors_ && ::ioctl(fd_,command)==0;
+    }
+    std::optional<orbit_sensor_state> sensor_state() override {
+        if(!sensors_)return {};
+        orbit_sensor_state state{};
+        if(::ioctl(fd_,ORBIT_SENSOR_GET_STATE,&state)!=0)return {};
+        return state;
     }
 };
 #endif
@@ -166,6 +178,17 @@ public:
     bool set_rate(std::uint32_t ms) {
         if(ms<1 || ms>60000)return false;
         return io_->set_rate({2,ms,{0,0}});
+    }
+    bool enable() {return io_->control(ORBIT_SENSOR_ENABLE);}
+    bool disable() {return io_->control(ORBIT_SENSOR_DISABLE);}
+    bool reset() {return io_->control(ORBIT_SENSOR_RESET);}
+    bool clear_fault() {return io_->control(ORBIT_SENSOR_CLEAR_FAULT);}
+    orbit_sensor_state state() {
+        const auto value=io_->sensor_state();
+        if(!value || value->abi_version!=2 || value->enabled>1 || value->period_ms<1 ||
+           value->period_ms>60000 || value->fault_category>5 || value->reserved[0] || value->reserved[1])
+            throw std::runtime_error("invalid multisensor device state");
+        return *value;
     }
     std::vector<orbit_sensor_sample> read(std::size_t maximum) {
         if(!maximum || !io_->ready(25))return {};

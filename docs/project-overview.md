@@ -235,11 +235,11 @@ the old session and queued work.
 
 | Command | Native fake source | Linux device source |
 |---|---|---|
-| enable / disable | Implemented | Rejected: control UAPI still needed |
+| enable / disable | Implemented | Implemented through real ioctl/register effects |
 | set-period, 1–60000 ms | Implemented | Implemented through real ioctl |
-| reset | Implemented | Rejected: control UAPI still needed |
-| clear-fault | Implemented | Rejected: control UAPI still needed |
-| query-state | Implemented, read-only | Rejected: truthful state UAPI still needed |
+| reset | Implemented | Implemented through real ioctl/register effects |
+| clear-fault | Implemented | Implemented through real ioctl/register effects |
+| query-state | Implemented, read-only | Reports actual enable/rate/generation/fault/reset state through ioctl |
 
 A device rate command reports applied only after its ioctl succeeds. An uncertain
 failure is not represented as simulated success. If a connection disappears
@@ -285,7 +285,7 @@ a sustained-throughput benchmark. See [driver details](driver.md).
 | M4 security/control | Mutual TLS, identity authorization, native commands and replay/deadline policy tested |
 | M5 guest | Passed two real boots: 7 retained samples + 100 new = 107 ground rows across two boot IDs |
 | M6 driver test source | Passed syscall/lifecycle gate and 100 driver-origin TLS samples |
-| M7 custom peripheral | ABI2 hub/IRQ driver implemented; actual QTest, driver rebind contract, EXTRA-durable 600-second guest baseline and three abrupt-power-cut recoveries passed |
+| M7 custom peripheral | Complete: ABI2 hub/IRQ driver, binding schema, controls/state UAPI, QTest, driver rebind contract, EXTRA-durable baseline and abrupt-power-cut recovery passed |
 | M8 fault/measurement | Native and embedded 600-second baselines passed; overload/window/recovery tests expanded; embedded 100 Hz limit measured; full fault matrix pending |
 | M9 release | Clean source tests and clean-checkout smoke passed; release, patch/license and operational work pending |
 
@@ -313,6 +313,8 @@ Local embedded evidence is retained, ignored by Git, at:
   typed run, clock/resource measurements and image manifest.
 - `build/guest-evidence/m7-extra-baseline-001/`: final EXTRA-durable 600-second
   typed run, raw serial/resource data, ground database and exact image manifest.
+- `build/guest-evidence/m7-controls-001/`: rebuilt ARM64 image, ABI2 control/state
+  syscall contract and short authenticated sensor-path regression.
 
 These directories contain no copied private keys. They are local evidence,
 not a published release archive. Earlier failed attempts were preserved in the
@@ -328,9 +330,9 @@ uses MMIO 0x090c0000 and GIC SPI 10 (INTID 42) on pinned virt-9.2. The driver bi
 to these real emulated resources. Complete roadmap acceptance, negative probe
 and binding-schema coverage should be checked separately from a passing data path.
 
-Driver control/state UAPI must then support real enable/disable/reset/clear-fault
-and truthful query-state, with the existing authorization/replay/deadline rules
-preserved through ioctl and register effects.
+The driver control/state UAPI now supports real enable/disable/reset/clear-fault
+and truthful query-state. The existing authorization/replay/deadline rules feed
+these ioctl/register effects through the acquisition-owned command dispatcher.
 
 M8 still needs abrupt guest-power-loss tests, physical-disk/storage fault
 scenarios, the full embedded network/device fault matrix, kernel-loss reporting,

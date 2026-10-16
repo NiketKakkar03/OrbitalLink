@@ -19,6 +19,7 @@ from ground.orbit_protocol import (
     encode_telemetry_sample,
 )
 from ground.orbit_storage import TelemetryStorage
+from ground import durable_test_profile
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -109,30 +110,33 @@ def receive_exact(connection: socket.socket, byte_count: int) -> bytes:
     return bytes(chunks)
 
 
-def test_native_sender_persists_10000_exact_samples_and_deduplicates(
+def test_native_sender_persists_exact_samples_and_deduplicates(
     tmp_path: Path, native_sender: Path
 ):
-    sample_count = 10_000
+    sample_count = durable_test_profile.sample_count()
     duplicate_count = 100
     ground, database, port = start_ground(
         tmp_path, max_receipts=sample_count + duplicate_count
     )
     try:
+        started = time.monotonic()
         sender = subprocess.run(
             [str(native_sender), "127.0.0.1", str(port), str(sample_count), str(duplicate_count)],
             cwd=PROJECT_ROOT,
             capture_output=True,
             text=True,
-            timeout=60,
+            timeout=durable_test_profile.sender_timeout(sample_count),
         )
         assert sender.returncode == 0, sender.stderr
-        assert sender.stdout == "acknowledged 10100 samples\n"
+        assert sender.stdout == f"acknowledged {sample_count + duplicate_count} samples\n"
         ground.wait(timeout=10)
         assert ground.returncode == 0, ground.stderr.read().decode()
 
         storage = TelemetryStorage(database)
         try:
             assert storage.load_samples() == [expected_sample(index) for index in range(sample_count)]
+            acknowledged = int(sender.stdout.split()[1])
+            durable_test_profile.write_evidence(tmp_path / "result.json", storage, sample_count, acknowledged, time.monotonic() - started, transport=True)
         finally:
             storage.close()
     finally:

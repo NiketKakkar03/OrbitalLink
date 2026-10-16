@@ -3,6 +3,8 @@
 #include "retention_queue.hpp"
 #include "durable_outbox.hpp"
 #include "device_source.hpp"
+#include "run_metrics.hpp"
+#include "scenario_source.hpp"
 #include "retry_policy.hpp"
 #include "command_policy.hpp"
 
@@ -12,6 +14,8 @@
 #include <poll.h>
 #include <signal.h>
 #include <sys/socket.h>
+#include <sys/resource.h>
+#include <sys/statvfs.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -64,7 +68,11 @@ struct Config {
     std::string source{"fake"};
     std::string device_path{"/dev/orbit_telemetry"};
     std::uint64_t outbox_bytes{64*1024*1024};
+    std::size_t send_window{1};
+    std::size_t storage_batch{1};
+    bool priority_scheduling{};
     std::uint16_t port{};
+    std::uint64_t scenario_seed{1};
     std::uint64_t count{100};
     std::uint64_t interval_ms{100};
     std::size_t capacity{
@@ -85,6 +93,7 @@ struct Config {
     }()};
     bool fake_fault{};
     bool explicit_boot_id{};
+    bool explicit_device{};
     int ready_fd{-1};
 };
 
@@ -104,19 +113,46 @@ struct Counters {
 };
 
 struct Shared {
-    explicit Shared(const Config& config) : retained(config.capacity), gaps(16) {
-        if(!config.outbox_path.empty()) durable=std::make_unique<orbit::DurableOutbox>(config.outbox_path,config.outbox_bytes,config.capacity);
+    explicit Shared(const Config& config) : retained(config.capacity), gaps(16), source_label(config.source), storage_path(config.outbox_path) {
+        if(!config.outbox_path.empty()) durable=std::make_unique<orbit::DurableOutbox>(config.outbox_path,config.outbox_bytes,config.capacity,config.priority_scheduling);
+        configured_window=config.send_window;priority_enabled=config.priority_scheduling;configured_storage_batch=config.storage_batch;
+        if(config.source=="sensors") {
+            sensors=std::make_unique<orbit::SensorSource>(orbit::open_sensor_device(config.device_path));
+            sensor_clock_initial=sensors->clock_info();
+            commands.device_backend([this](const orbit::CommandRequest& request) {
+                bool applied=false;
+                switch(request.opcode) {
+                    case 1: applied=sensors->enable();break;
+                    case 2: applied=sensors->disable();break;
+                    case 3: applied=sensors->set_rate(request.argument);break;
+                    case 4: applied=sensors->reset();break;
+                    case 5: applied=sensors->clear_fault();break;
+                    case 6: applied=true;break;
+                    default:return orbit::DeviceCommandOutcome{orbit::CommandStatus::invalid_argument,{}};
+                }
+                if(!applied)return orbit::DeviceCommandOutcome{orbit::CommandStatus::outcome_unknown,{}};
+                try {
+                    const auto actual=sensors->state();
+                    return orbit::DeviceCommandOutcome{orbit::CommandStatus::applied,
+                        orbit::FakeDeviceState{!!actual.enabled,actual.period_ms,actual.generation,
+                            actual.fault_category!=0,actual.command_effects}};
+                } catch(...) {return orbit::DeviceCommandOutcome{orbit::CommandStatus::outcome_unknown,{}};}
+            });
+        }
         if(config.source=="device") {
             device=std::make_unique<orbit::DeviceSource>(orbit::open_device(config.device_path));
             commands.device_backend([this](const orbit::CommandRequest& request) {
-                if(request.opcode!=3)return orbit::CommandStatus::invalid_argument;
-                return device->set_rate(request.argument)?orbit::CommandStatus::applied:orbit::CommandStatus::outcome_unknown;
+                if(request.opcode!=3)return orbit::DeviceCommandOutcome{orbit::CommandStatus::invalid_argument,{}};
+                return orbit::DeviceCommandOutcome{device->set_rate(request.argument)?orbit::CommandStatus::applied:orbit::CommandStatus::outcome_unknown,{}};
             });
         }
     }
     std::unique_ptr<orbit::DurableOutbox> durable;
     std::unique_ptr<orbit::DeviceSource> device;
+    std::unique_ptr<orbit::SensorSource> sensors;
     orbit_stats driver_stats{};
+    orbit_sensor_clock sensor_clock_initial{}, sensor_clock_current{};
+    orbit_sensor_events sensor_events{};
     std::atomic<bool> storage_failed{false};
     orbit::RetentionQueueSnapshot retention_snapshot() const { return durable?durable->snapshot():retained.snapshot(); }
     orbit::RetentionQueue<orbit::TelemetrySample> retained;
@@ -126,6 +162,13 @@ struct Shared {
     std::atomic<bool> drain_active{false};
     std::atomic<ConnectionState> state{ConnectionState::disconnected};
     Counters counters;
+    orbit::RunMetrics metrics;
+    std::string source_label, storage_path;
+    std::uint64_t started_ns{monotonic_ns()};
+    std::array<std::uint64_t,7> category_counts{};
+    std::uint64_t scenario_events{}, generation_late_max_ns{}, sensor_fault_reports{}, event_coalesced{}, event_overflow{};
+    std::size_t configured_storage_batch{1};
+    std::size_t configured_window{};bool priority_enabled{};
     orbit::CommandDispatcher commands;
     std::atomic<bool> network_done{false};
 };
@@ -197,7 +240,7 @@ Config parse_args(int argc, char** argv) {
         if (i + 1 >= argc) throw std::invalid_argument(std::string("missing value for ") + argv[i]);
         const std::string option = argv[i];
         if (option == "--source") { config.source=argv[i+1]; continue; }
-        if (option == "--device") { config.device_path=argv[i+1]; continue; }
+        if (option == "--device") { config.device_path=argv[i+1];config.explicit_device=true; continue; }
         if (option == "--outbox") { config.outbox_path=argv[i+1]; continue; }
         if (option == "--authorized-command-server") { config.authorized_command_server=argv[i+1]; continue; }
         if (option == "--ca") { config.ca = argv[i + 1]; continue; }
@@ -205,7 +248,11 @@ Config parse_args(int argc, char** argv) {
         if (option == "--key") { config.key = argv[i + 1]; continue; }
         if (option == "--server-name") { config.server_name = argv[i + 1]; continue; }
         const auto value = parse_u64(argv[i + 1], option.c_str());
-        if (option == "--outbox-bytes") config.outbox_bytes=value;
+        if (option == "--storage-batch") config.storage_batch=static_cast<std::size_t>(value);
+        else if (option == "--send-window") config.send_window=static_cast<std::size_t>(value);
+        else if (option == "--priority-scheduling") {if(value>1)throw std::invalid_argument("priority-scheduling must be0or1");config.priority_scheduling=value!=0;}
+        else if (option == "--scenario-seed") config.scenario_seed=value;
+        else if (option == "--outbox-bytes") config.outbox_bytes=value;
         else if (option == "--fake-fault") config.fake_fault = value != 0;
         else if (option == "--count") config.count = value;
         else if (option == "--interval-ms") config.interval_ms = value;
@@ -223,9 +270,16 @@ Config parse_args(int argc, char** argv) {
         }
         else throw std::invalid_argument("unknown option: " + option);
     }
-    if(config.source!="fake" && config.source!="device")throw std::invalid_argument("source must be fake or device");
-    if(config.source=="device" && (config.interval_ms<1 || config.interval_ms>60000 || config.fake_fault))
+    if(config.source!="fake" && config.source!="device" && config.source!="scenario" && config.source!="sensors")throw std::invalid_argument("source must be fake, device, scenario or sensors");
+    if(config.source=="sensors" && !config.explicit_device)config.device_path="/dev/orbit_sensors";
+    if(config.scenario_seed>UINT32_MAX)throw std::invalid_argument("scenario seed exceeds uint32");
+    if(config.source=="scenario" && (config.interval_ms<1 || config.interval_ms>60000))throw std::invalid_argument("scenario period must be1..60000ms");
+    if((config.source=="device" || config.source=="sensors") && (config.interval_ms<1 || config.interval_ms>60000 || config.fake_fault))
         throw std::invalid_argument("device source requires period1..60000ms and does not support fake-fault");
+    if(config.storage_batch<1 || config.storage_batch>16)throw std::invalid_argument("storage-batch must be1..16");
+    if(config.storage_batch>1 && (config.send_window<2 || config.outbox_path.empty()))throw std::invalid_argument("storage-batch requires durable outbox and window>1");
+    if(config.send_window<1 || config.send_window>64)throw std::invalid_argument("send-window must be1..64");
+    if((config.send_window>1 || config.priority_scheduling) && config.outbox_path.empty())throw std::invalid_argument("sending window requires durable --outbox");
     if (config.capacity == 0) throw std::invalid_argument("capacity must be positive");
     if (config.max_frames_per_iteration == 0)
         throw std::invalid_argument("max-frames-per-iteration must be positive");
@@ -262,6 +316,8 @@ orbit::TelemetrySample make_sample(std::uint64_t index, std::uint64_t boot_id) {
 
 void retain_sample(const orbit::TelemetrySample& sample, Shared& shared) {
         shared.counters.generated.fetch_add(1);
+        if(sample.category<shared.category_counts.size())++shared.category_counts[sample.category];
+        if(sample.quality&1)++shared.sensor_fault_reports;
         if(shared.durable) {
             const auto displaced=shared.durable->push(sample);
             shared.counters.dropped_oldest.fetch_add(displaced.size());
@@ -274,6 +330,73 @@ void retain_sample(const orbit::TelemetrySample& sample, Shared& shared) {
 
 void acquisition_loop(const Config& config, Shared& shared) {
     shared.commands.configure(static_cast<std::uint32_t>(config.interval_ms), config.fake_fault);
+    if(shared.sensors) {
+        if(!shared.sensors->set_rate(static_cast<std::uint32_t>(config.interval_ms)))throw std::runtime_error("sensor SET_RATE failed");
+        shared.driver_stats=shared.sensors->stats();
+        auto reported_driver_drops=shared.driver_stats.dropped;
+        std::uint64_t acquired=0;
+        while(acquired<config.count && !shared.stop_requested.load()) {
+            shared.commands.execute(monotonic_ns());
+            const auto records=shared.sensors->read(static_cast<std::size_t>(std::min<std::uint64_t>(16,config.count-acquired)));
+            for(const auto& record:records) {
+                retain_sample(orbit::SensorSource::telemetry(record,config.boot_id,++acquired),shared);
+                if(record.category==6)++shared.scenario_events;
+            }
+            shared.driver_stats=shared.sensors->stats();
+            if(shared.driver_stats.dropped>reported_driver_drops) {
+                if(shared.durable)shared.durable->record_aggregate_loss(shared.driver_stats.dropped-reported_driver_drops);
+                reported_driver_drops=shared.driver_stats.dropped;
+            }
+        }
+        shared.acquisition_done.store(true);
+        while(!shared.network_done.load() && !shared.stop_requested.load()) {shared.commands.execute(monotonic_ns());std::this_thread::sleep_for(Milliseconds(1));}
+        shared.sensor_clock_current=shared.sensors->clock_info(true);
+        shared.sensor_events=shared.sensors->events_info();
+        shared.event_coalesced=shared.sensor_events.coalesced;shared.event_overflow=shared.sensor_events.overflow;
+        return;
+    }
+    if(config.source=="scenario") {
+        auto next=Clock::now();std::uint64_t sequence=0;std::uint32_t device_sequence=0;
+        orbit_event_accumulator pending_events{};
+        std::uint32_t scenario_generation=7;std::uint64_t scenario_offset=0;
+        for(std::uint64_t tick=0;tick<config.count && !shared.stop_requested.load();) {
+            shared.commands.execute(monotonic_ns());
+            const auto state=shared.commands.state();
+            if(!state.enabled) {next=Clock::now();std::this_thread::sleep_for(Milliseconds(1));continue;}
+            if(Clock::now()<next) {std::this_thread::sleep_for(Milliseconds(1));continue;}
+            const auto now=Clock::now();
+            const auto late=std::chrono::duration_cast<std::chrono::nanoseconds>(now-next).count();
+            shared.generation_late_max_ns=std::max(shared.generation_late_max_ns,static_cast<std::uint64_t>(std::max<std::int64_t>(0,late)));
+            orbit_scenario_record routine{},event{};
+            const bool reset=state.generation!=scenario_generation;
+            if(reset) {scenario_generation=state.generation;device_sequence=0;scenario_offset=tick;}
+            const auto has_event=orbit_scenario_tick(tick-scenario_offset,static_cast<std::uint32_t>(config.scenario_seed),&routine,&event);
+            if(reset) {
+                orbit_scenario_record reset_event{6,0,{7,0,4,1,0,0,0,0}};
+                if(!orbit_event_push(&pending_events,&reset_event))throw std::runtime_error("reset event accumulator full");
+            }
+            if(routine.category==4) {
+                routine.values[0]=static_cast<std::int32_t>(((monotonic_ns()-shared.started_ns)/1'000'000'000ULL)&0x7fffffffULL);
+                routine.values[1]=static_cast<std::int32_t>(state.generation>=7?state.generation-7:0);
+                // Source snapshot includes this generated record, staged here
+                // before its handoff to retention; earlier reports are delivered.
+                routine.values[2]=1;
+                routine.values[3]=static_cast<std::int32_t>((sequence+1)&0x7fffffffULL);
+                routine.values[4]=static_cast<std::int32_t>(sequence&0x7fffffffULL);
+            }
+            if(state.fault)routine.quality=1;
+            retain_sample(orbit::scenario_sample(routine,config.boot_id,++sequence,device_sequence++,monotonic_ns(),state.generation),shared);
+            if(has_event && !orbit_event_push(&pending_events,&event))throw std::runtime_error("native event accumulator full");
+            while(orbit_event_pop(&pending_events,&event)) {retain_sample(orbit::scenario_sample(event,config.boot_id,++sequence,device_sequence++,monotonic_ns(),state.generation),shared);++shared.scenario_events;}
+            shared.event_coalesced=pending_events.coalesced;shared.event_overflow=pending_events.overflow;
+            ++tick; next+=Milliseconds(state.period_ms);
+        }
+        shared.acquisition_done.store(true);
+        while(!shared.network_done.load() && !shared.stop_requested.load()) {
+            shared.commands.execute(monotonic_ns());std::this_thread::sleep_for(Milliseconds(1));
+        }
+        return;
+    }
     if(shared.device) {
         if(!shared.device->set_rate(static_cast<std::uint32_t>(config.interval_ms)))
             throw std::runtime_error("initial device SET_RATE failed");
@@ -499,6 +622,10 @@ void network_loop(const Config& config, Shared& shared) {
     Clock::time_point drain_deadline = Clock::time_point::max();
     bool drain_started = false;
     std::optional<orbit::TelemetrySample> in_flight;
+    struct PendingFrame {orbit::TelemetrySample sample;std::uint64_t sequence,sent_ns;Clock::time_point deadline;};
+    std::vector<PendingFrame> window;
+    std::vector<orbit::TelemetrySample> replayed;
+    const auto same_identity=[](const auto& a,const auto& b){return a.spacecraft_id==b.spacecraft_id && a.flight_boot_id==b.flight_boot_id && a.telemetry_sequence==b.telemetry_sequence;};
     const auto wait_backoff = [&](Milliseconds delay) {
         const auto deadline = Clock::now() + delay;
         while (Clock::now() < deadline &&
@@ -514,6 +641,10 @@ void network_loop(const Config& config, Shared& shared) {
     };
 
     while (true) {
+        if(!socket && !window.empty()) {
+            replayed.clear();for(const auto& item:window)replayed.push_back(item.sample);
+            window.clear();shared.durable->release_claims();
+        }
         if ((shared.acquisition_done.load() || shared.stop_requested.load()) && !drain_started) {
             drain_started = true;
             shared.drain_active.store(true);
@@ -525,7 +656,7 @@ void network_loop(const Config& config, Shared& shared) {
             drain_deadline = Clock::now() + Milliseconds(budget);
         }
         const auto queue_snapshot = shared.retention_snapshot();
-        if (!in_flight && queue_snapshot.size == 0 && (!shared.durable || shared.durable->losses().empty())) {
+        if (!in_flight && window.empty() && queue_snapshot.size == 0 && (!shared.durable || shared.durable->losses().empty())) {
             // Acquisition is the only producer. Do not close the queue until it
             // has explicitly finished: it may have passed its stop check and be
             // immediately about to perform its final push.
@@ -624,7 +755,7 @@ void network_loop(const Config& config, Shared& shared) {
             }
         }
 
-        if(shared.durable) {
+        if(shared.durable && window.empty()) {
             if(auto loss=shared.durable->claim_loss()) {
                 orbit::LossReport report{1,loss->boot_id,loss->id,loss->first,loss->last,loss->count,loss->detail_complete?1U:2U};
                 auto deadline=Clock::now()+Milliseconds(config.io_timeout_ms);
@@ -653,6 +784,70 @@ void network_loop(const Config& config, Shared& shared) {
             }
         }
 
+        if(config.send_window>1) {
+            bool failed=false,invalid=false;
+            const bool drain_for_loss=!window.empty() && !shared.durable->losses().empty();
+            while(!drain_for_loss && window.size()<config.send_window) {
+                auto next=shared.durable->claim_next(config.send_window);
+                if(!next)break;
+                auto deadline=Clock::now()+Milliseconds(config.io_timeout_ms);
+                if(!window.empty())deadline=std::min(deadline,window.front().deadline);
+                if(drain_started)deadline=std::min(deadline,drain_deadline);
+                const auto sent_ns=monotonic_ns();
+                const auto frame=orbit::encode_telemetry_sample(*next,message_sequence++);
+                shared.counters.transmission_attempts.fetch_add(1);
+                if(std::any_of(replayed.begin(),replayed.end(),[&](const auto& prior){return same_identity(prior,*next);}))shared.counters.retransmissions.fetch_add(1);
+                window.push_back({*next,message_sequence-1,sent_ns,Clock::now()+Milliseconds(config.io_timeout_ms)});
+                if(!send_bytes(socket,frame,deadline)){shared.counters.send_failures.fetch_add(1);failed=true;break;}
+                shared.metrics.sent(frame.size());
+            }
+            if(!failed && !window.empty()) {
+                struct ReceivedAck {orbit::TelemetrySample sample;std::uint64_t latency,source_latency;};
+                std::vector<ReceivedAck> acknowledged;
+                try {
+                    for(unsigned frames=0;frames<config.storage_batch+16 && !window.empty();++frames) {
+                        if(!acknowledged.empty()) {
+                            pollfd ready{socket.get(),POLLIN,0};
+#ifndef ORBIT_TEST_PLAINTEXT
+                            const bool buffered=SSL_pending(socket.tls)>0;
+#else
+                            const bool buffered=false;
+#endif
+                            if(!buffered && !(::poll(&ready,1,0)>0 && ready.revents))break;
+                        }
+                        auto deadline=window.front().deadline;
+                        if(drain_started)deadline=std::min(deadline,drain_deadline);
+                        std::vector<std::uint8_t> bytes;
+                        if(!receive_frame(socket,bytes,deadline)){failed=true;break;}
+                        const auto decoded=orbit::decode_frame(bytes);
+                        if(decoded.header.message_type==orbit::kCommandRequest) {
+                            if(!dispatch_command(socket,decoded,shared,command_authorized,deadline)){failed=true;break;}
+                            continue;
+                        }
+                        auto found=std::find_if(window.begin(),window.end(),[&](const auto& item){return decoded.header.message_type==orbit::kTelemetryAck && decoded.header.message_sequence==item.sequence && same_identity(decoded.ack,item.sample);});
+                        if(found==window.end()){invalid=true;failed=true;break;}
+                        const auto now=monotonic_ns();
+                        acknowledged.push_back({found->sample,now-found->sent_ns,found->sample.flight_boot_id==config.boot_id && found->sample.timestamp_monotonic_ns<=now?now-found->sample.timestamp_monotonic_ns:0});
+                        window.erase(found);
+                        if(acknowledged.size()>=config.storage_batch)break;
+                    }
+                }catch(const orbit::ProtocolError&){failed=true;invalid=true;}
+                if(!acknowledged.empty()) {
+                    std::vector<orbit::TelemetrySample> samples;
+                    for(const auto& item:acknowledged)samples.push_back(item.sample);
+                    shared.durable->acknowledge_batch(samples);
+                    for(const auto& item:acknowledged)shared.metrics.acked(item.latency,item.source_latency);
+                    shared.counters.acknowledged.fetch_add(samples.size());retry.reset();
+                }else failed=true;
+            }
+            if(failed) {
+                if(invalid)shared.counters.invalid_acks.fetch_add(1);else shared.counters.receive_failures.fetch_add(1);
+                socket.reset();shared.commands.close();shared.counters.reconnects.fetch_add(1);
+                shared.state.store(ConnectionState::backoff);wait_backoff(retry.next_delay());
+            }
+            continue;
+        }
+
         std::size_t processed = 0;
         while (socket && processed < config.max_frames_per_iteration) {
             if (!in_flight) {
@@ -672,6 +867,7 @@ void network_loop(const Config& config, Shared& shared) {
                              std::chrono::duration_cast<Milliseconds>(drain_deadline - Clock::now())));
             }
             const auto send_deadline = Clock::now() + operation_timeout;
+            const auto sent_ns=monotonic_ns();
             if (!send_bytes(socket, frame, send_deadline)) {
                 shared.counters.send_failures.fetch_add(1);
                 socket.reset(); shared.commands.close();
@@ -680,6 +876,7 @@ void network_loop(const Config& config, Shared& shared) {
                 wait_backoff(retry.next_delay());
                 break;
             }
+            shared.metrics.sent(frame.size());
             const auto ack = require_ack(
                 socket, sample, message_sequence,
                 static_cast<std::uint64_t>(operation_timeout.count()), shared, command_authorized);
@@ -693,7 +890,9 @@ void network_loop(const Config& config, Shared& shared) {
                 break;
             }
 
+            const auto ack_ns=monotonic_ns();
             if(shared.durable) shared.durable->acknowledge(sample);
+            shared.metrics.acked(ack_ns-sent_ns,sample.flight_boot_id==config.boot_id && sample.timestamp_monotonic_ns<=ack_ns?ack_ns-sample.timestamp_monotonic_ns:0);
             shared.counters.acknowledged.fetch_add(1);
             retry.reset();
             in_flight.reset();
@@ -704,6 +903,7 @@ void network_loop(const Config& config, Shared& shared) {
     }
 
     socket.reset(); shared.commands.close();
+    if(shared.durable)shared.durable->release_claims();
     shared.state.store(ConnectionState::stopping);
     std::uint64_t discarded = shared.durable?0:(in_flight ? 1 : 0);
     if(!shared.durable) discarded += shared.retained.discard(std::numeric_limits<std::size_t>::max());
@@ -735,8 +935,8 @@ void print_summary(const Shared& shared) {
               << ",\"gap_omitted_dropped\":" << gaps.omitted_dropped
               << ",\"gap_detail_complete\":" << (gaps.detail_complete ? "true" : "false")
               << ",\"command_effects\":" << device.effects
-              << ",\"source\":\"" << (shared.device?"device":"fake") << "\"";
-    if(shared.device) {
+              << ",\"source\":\"" << shared.source_label << "\"";
+    if(shared.device || shared.sensors) {
         std::cout << ",\"driver_generated\":" << shared.driver_stats.generated
                   << ",\"driver_enqueued\":" << shared.driver_stats.enqueued
                   << ",\"driver_dropped\":" << shared.driver_stats.dropped
@@ -768,6 +968,35 @@ void print_summary(const Shared& shared) {
                   << ",\"durable_retained\":" << totals.retained
                   << ",\"durable_loss_acknowledged\":" << totals.loss_acknowledged;
     }
+    std::cout<<",\"send_window\":"<<shared.configured_window<<",\"priority_scheduling\":"<<(shared.priority_enabled?"true":"false")
+             <<",\"storage_batch\":"<<shared.configured_storage_batch
+             <<",\"sensor_fault_reports\":"<<shared.sensor_fault_reports
+             <<",\"event_coalesced\":"<<shared.event_coalesced<<",\"event_overflow\":"<<shared.event_overflow
+             <<",\"reset_count\":"<<((shared.device||shared.sensors)?shared.driver_stats.reserved[1]:(device.generation>=7?device.generation-7:0));
+    if(shared.sensors)std::cout<<",\"event_observations\":"<<shared.sensor_events.observations<<",\"event_pending\":"<<shared.sensor_events.pending
+        <<",\"sensor_clock_offset_ns\":"<<shared.sensor_clock_initial.offset_ns
+        <<",\"sensor_clock_uncertainty_ns\":"<<shared.sensor_clock_initial.uncertainty_ns
+        <<",\"sensor_clock_current_offset_ns\":"<<shared.sensor_clock_current.offset_ns
+        <<",\"sensor_clock_current_uncertainty_ns\":"<<shared.sensor_clock_current.uncertainty_ns;
+    shared.metrics.json(std::cout);
+    const auto elapsed=monotonic_ns()-shared.started_ns;
+    struct rusage resources{};const bool have_usage=::getrusage(RUSAGE_SELF,&resources)==0;
+    struct statvfs storage{};const bool have_storage=::statvfs(shared.storage_path.empty()?".":shared.storage_path.c_str(),&storage)==0;
+    std::cout<<",\"run_uptime_ns\":"<<elapsed<<",\"scenario_events\":"<<shared.scenario_events
+             <<",\"generation_late_max_ns\":"<<shared.generation_late_max_ns<<",\"category_generated\":[";
+    for(std::size_t i=0;i<shared.category_counts.size();++i) {if(i)std::cout<<',';std::cout<<shared.category_counts[i];}
+    std::cout<<"],\"storage_free_bytes\":";
+    if(have_storage)std::cout<<static_cast<std::uint64_t>(storage.f_bavail)*storage.f_frsize;else std::cout<<"null";
+    std::cout<<",\"process_peak_rss_bytes\":";
+    if(have_usage) {
+#ifdef __APPLE__
+        std::cout<<resources.ru_maxrss;
+#else
+        std::cout<<static_cast<std::uint64_t>(resources.ru_maxrss)*1024;
+#endif
+    } else std::cout<<"null";
+    std::cout<<",\"process_cpu_us\":";
+    if(have_usage)std::cout<<static_cast<std::uint64_t>(resources.ru_utime.tv_sec+resources.ru_stime.tv_sec)*1000000+resources.ru_utime.tv_usec+resources.ru_stime.tv_usec;else std::cout<<"null";
     std::cout << "}\n";
 }
 

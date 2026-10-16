@@ -1,0 +1,4 @@
+The driver sources are licensed under GPL-2.0. UAPI headers carry the
+GPL-2.0 WITH Linux-syscall-note exception. The complete GPL-2.0 license text is
+provided by the Linux kernel source used to build the module at
+LICENSES/preferred/GPL-2.0.

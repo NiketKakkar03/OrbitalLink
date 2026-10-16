@@ -18,7 +18,7 @@ from typing import Protocol
 from ground.orbit_protocol import (
     FrameParser,
     ProtocolError,
-    TELEMETRY_SAMPLE,
+    TELEMETRY_SAMPLE, SENSOR_SAMPLE, CATEGORY_NAMES,
     COMMAND_SESSION, COMMAND_RESULT, STATE_SNAPSHOT, LOSS_REPORT, LossReport, encode_loss_ack, ControlMessage,
     TelemetryAck,
     TelemetrySample,
@@ -39,6 +39,15 @@ class SampleStorage(Protocol):
 
 def classify_physical_validity(sample: TelemetrySample) -> tuple[bool, str | None]:
     """Classify plausible sensor values without confusing them with corrupt frames."""
+    if sample.category:
+        reasons = []
+        if sample.quality & 1:
+            reasons.append("sensor_fault")
+        if sample.category == 1 and (not 0 <= sample.values[0] <= 6000 or not 0 <= sample.values[2] <= 1000):
+            reasons.append("power_out_of_range")
+        if sample.category == 2 and any(not -100000 <= value <= 150000 for value in sample.values[:2]):
+            reasons.append("temperature_out_of_range")
+        return not reasons, ",".join(reasons) or None
     reasons: list[str] = []
     if not -100_000 <= sample.temperature_millideg_c <= 150_000:
         reasons.append("temperature_out_of_range")
@@ -71,7 +80,58 @@ class GroundReceiver:
                 parser.finish()
                 return
 
-            for header, message in parser.feed(chunk):
+            frames=parser.feed(chunk)
+            telemetry_types=(TELEMETRY_SAMPLE,SENSOR_SAMPLE)
+            eof=False
+            # TLS commonly returns one application record per recv. Drain only
+            # bytes already available, with no batch-fill delay and a hard bound
+            # on additional socket calls. Partial parser state survives a WANT_READ.
+            if hasattr(connection,"gettimeout") and hasattr(connection,"settimeout"):
+                previous_timeout=connection.gettimeout()
+                try:
+                    connection.settimeout(0.0)
+                    queued=sum(header.message_type in telemetry_types for header,_ in frames)
+                    control=any(header.message_type not in telemetry_types for header,_ in frames)
+                    for _ in range(16):
+                        if queued>=16 or control:break
+                        try:
+                            available=connection.recv(64*1024)
+                        except (ssl.SSLWantReadError,ssl.SSLWantWriteError,BlockingIOError,TimeoutError):
+                            break
+                        if not available:
+                            eof=True;break
+                        parsed=parser.feed(available)
+                        frames.extend(parsed)
+                        queued+=sum(header.message_type in telemetry_types for header,_ in parsed)
+                        control=any(header.message_type not in telemetry_types for header,_ in parsed)
+                finally:
+                    connection.settimeout(previous_timeout)
+
+            pending=[]
+            def flush_samples():
+                if not pending:return
+                records=[(message,*classify_physical_validity(message)) for _,message in pending]
+                if hasattr(self._storage,"store_samples"):
+                    self._storage.store_samples(records)
+                else:
+                    for message,valid,reason in records:
+                        self._storage.store_sample(message,physically_valid=valid,validity_reason=reason)
+                # Every record is committed before the first batch ACK. A
+                # partial ACK write leaves durable rows safe for replay/dedup.
+                for header,message in pending:
+                    ack=TelemetryAck(message.spacecraft_id,message.flight_boot_id,message.telemetry_sequence)
+                    connection.sendall(encode_telemetry_ack(ack,header.message_sequence))
+                    self.receipts+=1
+                pending.clear()
+
+            for header, message in frames:
+                if header.message_type in (TELEMETRY_SAMPLE,SENSOR_SAMPLE) and isinstance(message,TelemetrySample):
+                    pending.append((header,message))
+                    if len(pending)==16:flush_samples()
+                    continue
+                # Control and loss frames keep their original ordering relative
+                # to telemetry, including their own commit-before-ACK boundary.
+                flush_samples()
                 if header.message_type == COMMAND_SESSION and isinstance(message, ControlMessage):
                     if self.broker: self.broker.open(*struct.unpack('!QQQ',message.payload))
                     continue
@@ -92,24 +152,13 @@ class GroundReceiver:
                         from ground.orbit_commands import STATUS_NAMES
                         self._storage.record_command_result(command_id=identifier,command_session_id=session,command_sequence=sequence,status=STATUS_NAMES[status])
                     continue
-                if header.message_type != TELEMETRY_SAMPLE or not isinstance(message, TelemetrySample):
+                if header.message_type not in (TELEMETRY_SAMPLE, SENSOR_SAMPLE) or not isinstance(message, TelemetrySample):
                     raise ProtocolError("ground receiver expected telemetry sample")
 
-                # store_sample returns only after its transaction commits.  A
-                # duplicate is already durable, so it receives the same ACK.
-                physically_valid, validity_reason = classify_physical_validity(message)
-                self._storage.store_sample(
-                    message,
-                    physically_valid=physically_valid,
-                    validity_reason=validity_reason,
-                )
-                ack = TelemetryAck(
-                    spacecraft_id=message.spacecraft_id,
-                    flight_boot_id=message.flight_boot_id,
-                    telemetry_sequence=message.telemetry_sequence,
-                )
-                connection.sendall(encode_telemetry_ack(ack, header.message_sequence))
-                self.receipts += 1
+            flush_samples()
+            if eof:
+                parser.finish()
+                return
 
 
 def serve(
@@ -147,7 +196,9 @@ def serve(
             listener.settimeout(0.2)
             actual_port = listener.getsockname()[1]
             if ready_file is not None:
-                ready_file.write_text(f"{actual_port}\n")
+                temporary_ready = ready_file.with_name(f".{ready_file.name}.tmp")
+                temporary_ready.write_text(f"{actual_port}\n")
+                temporary_ready.replace(ready_file)
 
             while not own_stop_event.is_set():
                 if max_receipts is not None and receiver.receipts >= max_receipts:
@@ -217,18 +268,21 @@ def main() -> int:
         try:
             if arguments.status:
                 print(f"telemetry_samples={storage.count_samples()}")
+                counts = storage.category_counts()
+                if any(name != "legacy" for name in counts):
+                    print("categories=" + json.dumps(counts, sort_keys=True))
                 return 0
             records = storage.load_records()
             if arguments.tail is not None:
                 if arguments.tail < 1:
                     parser.error("--tail COUNT must be positive")
                 for record in records[-arguments.tail :]:
-                    print(json.dumps(asdict(record), sort_keys=True))
+                    print(json.dumps({**asdict(record), "category_name": CATEGORY_NAMES[record.sample.category]}, sort_keys=True))
                 return 0
             assert arguments.export is not None
             with arguments.export.open("w") as output:
                 for record in records:
-                    output.write(json.dumps(asdict(record), sort_keys=True) + "\n")
+                    output.write(json.dumps({**asdict(record), "category_name": CATEGORY_NAMES[record.sample.category]}, sort_keys=True) + "\n")
             print(f"exported={len(records)} path={arguments.export}")
             return 0
         finally:

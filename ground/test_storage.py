@@ -1,9 +1,11 @@
 import sqlite3
+import time
 
 import pytest
 
 from ground.orbit_protocol import TelemetrySample
 from ground.orbit_storage import TelemetryStorage
+from ground import durable_test_profile
 
 
 def make_sample(**changes: int) -> TelemetrySample:
@@ -29,6 +31,32 @@ def test_stores_and_loads_sample(tmp_path):
     assert storage.load_samples() == [sample]
 
     storage.close()
+
+
+def test_power_cut_durability_settings_are_applied_on_every_open(tmp_path):
+    path = tmp_path / "durability.db"
+    # A caller's previous connection settings cannot weaken this connection.
+    with sqlite3.connect(path) as previous:
+        assert previous.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+        previous.execute("PRAGMA synchronous=OFF")
+    previous.close()
+    for iteration in range(2):
+        storage = TelemetryStorage(path)
+        try:
+            assert storage.connection.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+            assert storage.connection.execute("PRAGMA synchronous").fetchone()[0] == 3
+            assert storage.connection.execute("PRAGMA fullfsync").fetchone()[0] == 1
+            if iteration == 0:
+                assert storage.store_sample(make_sample())
+            else:
+                assert storage.load_samples() == [make_sample()]
+        finally:
+            storage.close()
+
+
+def test_nonpersistent_ground_storage_is_rejected():
+    with pytest.raises(RuntimeError, match="durability settings"):
+        TelemetryStorage(":memory:")
 
 
 def test_duplicate_sample_is_idempotent(tmp_path):
@@ -150,10 +178,11 @@ def test_command_results_are_idempotent(tmp_path):
     storage.close()
 
 
-def test_stores_ten_thousand_deterministic_samples_exactly(tmp_path):
+def test_stores_deterministic_samples_exactly(tmp_path):
+    sample_count = durable_test_profile.sample_count()
     storage = TelemetryStorage(tmp_path / "telemetry.db")
-
-    for sequence in range(10_000):
+    started = time.monotonic()
+    for sequence in range(sample_count):
         sample = make_sample(
             telemetry_sequence=sequence,
             device_sequence=sequence,
@@ -164,8 +193,8 @@ def test_stores_ten_thousand_deterministic_samples_exactly(tmp_path):
         assert storage.store_sample(sample, received_at_unix_ns=sequence) is True
 
     loaded = storage.load_samples()
-    assert storage.count_samples() == 10_000
-    assert len(loaded) == 10_000
+    assert storage.count_samples() == sample_count
+    assert len(loaded) == sample_count
     for sequence, sample in enumerate(loaded):
         assert sample == make_sample(
             telemetry_sequence=sequence,
@@ -175,4 +204,5 @@ def test_stores_ten_thousand_deterministic_samples_exactly(tmp_path):
             voltage_millivolts=3_300 + (sequence % 10),
         )
 
+    durable_test_profile.write_evidence(tmp_path / "result.json", storage, sample_count, sample_count, time.monotonic() - started)
     storage.close()

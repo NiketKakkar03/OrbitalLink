@@ -27,6 +27,10 @@ TelemetrySample sample(sqlite3_stmt* statement, int column) {
     return decode_frame(std::vector<std::uint8_t>(bytes,bytes+length)).sample;
 }
 std::string identity(std::uint64_t value) { return std::to_string(value); }
+template<class T> unsigned priority(const T& value) {
+    if constexpr(requires{value.category;})return value.category==6?0:(value.category==5?2:1);
+    return 1;
+}
 }
 void DurableOutbox::exec(const std::string& sql) const {
     if (sqlite3_exec(db_,sql.c_str(),nullptr,nullptr,nullptr)!=SQLITE_OK)
@@ -37,7 +41,7 @@ std::uint64_t DurableOutbox::scalar(const std::string& sql) const {
     if(sqlite3_step(statement.get())!=SQLITE_ROW) throw std::runtime_error("outbox query failed");
     return static_cast<std::uint64_t>(sqlite3_column_int64(statement.get(),0));
 }
-DurableOutbox::DurableOutbox(const std::string& path,std::uint64_t bytes,std::size_t capacity):capacity_(capacity) {
+DurableOutbox::DurableOutbox(const std::string& path,std::uint64_t bytes,std::size_t capacity,bool priorities):priorities_(priorities),capacity_(capacity) {
     if(bytes<262144 || bytes>1073741824 || !capacity) throw std::invalid_argument("outbox bytes must be 256 KiB..1 GiB and capacity positive");
     lock_fd_=::open((path+".lock").c_str(),O_CREAT|O_RDWR,0600);
     if(lock_fd_<0 || flock(lock_fd_,LOCK_EX|LOCK_NB)!=0) {
@@ -49,7 +53,17 @@ DurableOutbox::DurableOutbox(const std::string& path,std::uint64_t bytes,std::si
         if(sqlite3_open_v2(path.c_str(),&db_,SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE|SQLITE_OPEN_FULLMUTEX,nullptr)!=SQLITE_OK)
             throw std::runtime_error("cannot open outbox");
         sqlite3_busy_timeout(db_,1000);
-        exec("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; PRAGMA fullfsync=ON; PRAGMA page_size=4096; PRAGMA temp_store=MEMORY;");
+        // DELETE commits by unlinking the rollback journal. EXTRA also syncs
+        // that directory entry: FULL alone can lose the last committed
+        // transaction after an OS/VM power cut. Keep macOS fullfsync enabled.
+        exec("PRAGMA journal_mode=DELETE; PRAGMA synchronous=EXTRA; PRAGMA fullfsync=ON; PRAGMA page_size=4096; PRAGMA temp_store=MEMORY;");
+        {
+            auto journal=prepare(db_,"PRAGMA journal_mode");
+            if(sqlite3_step(journal.get())!=SQLITE_ROW ||
+               std::string(reinterpret_cast<const char*>(sqlite3_column_text(journal.get(),0)))!="delete" ||
+               scalar("PRAGMA synchronous")!=3 || scalar("PRAGMA fullfsync")!=1)
+                throw std::runtime_error("outbox requires DELETE/EXTRA durability settings");
+        }
         // Conservatively reserve two database lengths for rollback journal and
         // its per-page/header overhead, plus 64 KiB. No WAL sidecar can grow.
         const auto pages=(bytes-65536)/3/4096;
@@ -57,14 +71,48 @@ DurableOutbox::DurableOutbox(const std::string& path,std::uint64_t bytes,std::si
         if(scalar("PRAGMA page_count")>pages) throw std::runtime_error("existing outbox exceeds selected disk budget");
         if(scalar("PRAGMA page_size")!=4096) throw std::runtime_error("unsupported outbox page size");
         exec("PRAGMA max_page_count="+std::to_string(pages));
-        exec("CREATE TABLE IF NOT EXISTS samples(id INTEGER PRIMARY KEY AUTOINCREMENT, frame BLOB NOT NULL);"
+        exec("CREATE TABLE IF NOT EXISTS samples(id INTEGER PRIMARY KEY AUTOINCREMENT, frame BLOB NOT NULL, priority INTEGER NOT NULL DEFAULT 1);"
              "CREATE TABLE IF NOT EXISTS loss(id INTEGER PRIMARY KEY AUTOINCREMENT, boot TEXT NOT NULL, first TEXT NOT NULL, last TEXT NOT NULL, count INTEGER NOT NULL, complete INTEGER NOT NULL, frozen INTEGER NOT NULL DEFAULT 0);"
              "CREATE TABLE IF NOT EXISTS counters(name TEXT PRIMARY KEY, value INTEGER NOT NULL);"
              "INSERT OR IGNORE INTO counters VALUES('generated',0),('acked',0),('dropped',0),('loss_acked',0);");
+        bool has_priority=false;
+        {auto columns=prepare(db_,"PRAGMA table_info(samples)");while(sqlite3_step(columns.get())==SQLITE_ROW)
+            if(std::string(reinterpret_cast<const char*>(sqlite3_column_text(columns.get(),1)))=="priority")has_priority=true;}
+        if(!has_priority)exec("ALTER TABLE samples ADD COLUMN priority INTEGER NOT NULL DEFAULT 1");
+        exec("CREATE INDEX IF NOT EXISTS samples_priority ON samples(priority,id)");
         if(database_limit_<32768)throw std::runtime_error("outbox schema leaves no telemetry budget");
         capacity_=std::min<std::size_t>(capacity_,static_cast<std::size_t>((database_limit_-32768)/256));
         high_watermark_=static_cast<std::size_t>(scalar("SELECT count(*) FROM samples"));
         if(high_watermark_>capacity_)throw std::runtime_error("existing outbox exceeds selected record capacity; reopen with the previous capacity and drain it first");
+        if(priorities_ && high_watermark_) {
+            // A previous owner may have used FIFO mode, which deliberately
+            // writes priority1 even for typed frames. Rebuild scheduling keys
+            // from immutable payloads before claiming anything. Startup scans
+            // at most the configured retained capacity; memory stays64rows.
+            exec("BEGIN IMMEDIATE");
+            try {
+                std::uint64_t after=0;
+                for(;;) {
+                    std::vector<std::pair<std::uint64_t,unsigned>> changed;
+                    auto rows=prepare(db_,"SELECT id,frame,priority FROM samples WHERE id>"+identity(after)+" ORDER BY id LIMIT 64");
+                    unsigned scanned=0;int status;
+                    while((status=sqlite3_step(rows.get()))==SQLITE_ROW) {
+                        after=static_cast<std::uint64_t>(sqlite3_column_int64(rows.get(),0));++scanned;
+                        const auto derived=priority(sample(rows.get(),1));
+                        if(derived!=static_cast<unsigned>(sqlite3_column_int(rows.get(),2)))changed.emplace_back(after,derived);
+                    }
+                    if(status!=SQLITE_DONE)throw std::runtime_error("outbox priority rebuild read failed");
+                    rows.reset();
+                    for(const auto& [id,derived]:changed)
+                        exec("UPDATE samples SET priority="+std::to_string(derived)+" WHERE id="+identity(id));
+                    if(scanned<64)break;
+                }
+                exec("COMMIT");
+            }catch(...) {
+                if(!sqlite3_get_autocommit(db_))sqlite3_exec(db_,"ROLLBACK",nullptr,nullptr,nullptr);
+                throw;
+            }
+        }
     } catch(...) {
         if(db_)sqlite3_close(db_);
         db_=nullptr;::close(lock_fd_);lock_fd_=-1;throw;
@@ -83,6 +131,27 @@ std::vector<DurableLoss> DurableOutbox::losses_locked() const {
     return result;
 }
 std::vector<DurableLoss> DurableOutbox::losses() const {std::lock_guard lock(mutex_);return losses_locked();}
+void DurableOutbox::record_aggregate_loss(std::uint64_t count) {
+    if(!count)return;
+    std::lock_guard lock(mutex_);
+    exec("BEGIN IMMEDIATE");
+    try {
+        auto row=prepare(db_,"SELECT id FROM loss WHERE complete=0 AND frozen=0 ORDER BY id LIMIT 1");
+        if(sqlite3_step(row.get())==SQLITE_ROW) {
+            const auto id=static_cast<std::uint64_t>(sqlite3_column_int64(row.get(),0));
+            row.reset();exec("UPDATE loss SET count=count+"+identity(count)+" WHERE id="+identity(id));
+        } else {
+            row.reset();
+            if(scalar("SELECT count(*) FROM loss")>=65)throw std::runtime_error("outbox loss metadata exhausted; stop acquisition");
+            const auto id=(static_cast<std::uint64_t>(std::random_device{}())<<31 ^ std::random_device{}()) & 0x7fffffffffffffffULL;
+            exec("INSERT INTO loss(id,boot,first,last,count,complete) VALUES("+identity(id)+",'0','0','0',"+identity(count)+",0)");
+        }
+        exec("COMMIT");
+    } catch(...) {
+        if(!sqlite3_get_autocommit(db_))sqlite3_exec(db_,"ROLLBACK",nullptr,nullptr,nullptr);
+        throw;
+    }
+}
 void DurableOutbox::record_loss(const TelemetrySample& value) {
     auto reports=losses_locked();
     for(auto it=reports.rbegin();it!=reports.rend();++it) {
@@ -103,29 +172,42 @@ void DurableOutbox::record_loss(const TelemetrySample& value) {
 std::vector<TelemetrySample> DurableOutbox::push(const TelemetrySample& value) {
     std::lock_guard lock(mutex_);
     const auto size=scalar("SELECT count(*) FROM samples");
-    std::size_t eviction=size>=capacity_?static_cast<std::size_t>(size-capacity_+1):0;
+    const auto incoming_priority=priorities_?priority(value):1;
+    const auto reserve=priorities_ && capacity_>=8?std::min<std::size_t>(32,capacity_/8):0;
+    const auto limit=capacity_-(incoming_priority==0?0:reserve);
+    std::size_t eviction=size>=limit?static_cast<std::size_t>(size-limit+1):0;
+    // Once urgent rows occupy the reserve, routine insertion must not evict
+    // more than one record merely to shrink total occupancy below its quota.
+    if(eviction>1)eviction=1;
     // A persistent disk-full condition must not trigger a quadratic walk over
     // a potentially million-record backlog. Try geometric batches, capped at
     // 64 evictions and eight transactions, then fail without committing loss.
     constexpr std::size_t maximum_evictions=64;
-    const auto retry_limit=std::min<std::size_t>(maximum_evictions,static_cast<std::size_t>(size)-(claimed_?1:0));
+    const auto retry_limit=std::min<std::size_t>(maximum_evictions,static_cast<std::size_t>(size)-claimed_.size());
     for(;;) {
         std::vector<TelemetrySample> dropped;
         exec("BEGIN IMMEDIATE");
         try {
             for(std::size_t index=0;index<eviction;++index) {
-                const auto restriction=claimed_?" WHERE id<>"+identity(*claimed_):"";
-                auto front=prepare(db_,"SELECT id,frame FROM samples"+restriction+" ORDER BY id LIMIT 1");
-                if(sqlite3_step(front.get())!=SQLITE_ROW)throw std::runtime_error("outbox full with protected in-flight sample");
+                const auto restriction=" WHERE "+unclaimed_filter()+(priorities_?" AND priority>="+std::to_string(incoming_priority):"");
+                auto front=prepare(db_,"SELECT id,frame FROM samples"+restriction+(priorities_?" ORDER BY priority DESC,id LIMIT 1":" ORDER BY id LIMIT 1"));
+                if(sqlite3_step(front.get())!=SQLITE_ROW) {
+                    if(!priorities_)throw std::runtime_error("outbox full with protected in-flight sample");
+                    front.reset();record_loss(value);dropped.push_back(value);break;
+                }
                 const auto id=sqlite3_column_int64(front.get(),0);
                 auto lost=sample(front.get(),1);front.reset();
                 exec("DELETE FROM samples WHERE id="+std::to_string(id));
                 record_loss(lost);dropped.push_back(lost);
             }
-            auto insert=prepare(db_,"INSERT INTO samples(frame) VALUES(?)");
+            const bool reject_new=!dropped.empty() && dropped.back().flight_boot_id==value.flight_boot_id && dropped.back().telemetry_sequence==value.telemetry_sequence;
+            auto insert=prepare(db_,"INSERT INTO samples(frame,priority) VALUES(?,"+std::to_string(incoming_priority)+")");
             const auto frame=encode_telemetry_sample(value,0);
             if(sqlite3_bind_blob(insert.get(),1,frame.data(),static_cast<int>(frame.size()),SQLITE_TRANSIENT)!=SQLITE_OK)throw std::runtime_error("outbox bind failed");
-            done(db_,insert.get());insert.reset();
+            if(!reject_new) {
+                done(db_,insert.get());
+            }
+            insert.reset();
             exec("UPDATE counters SET value=value+1 WHERE name='generated'; UPDATE counters SET value=value+"+std::to_string(dropped.size())+" WHERE name='dropped';");
             exec("COMMIT");
             ++accepted_;dropped_+=dropped.size();high_watermark_=std::max(high_watermark_,static_cast<std::size_t>(size-dropped.size()+1));
@@ -141,26 +223,56 @@ std::vector<TelemetrySample> DurableOutbox::push(const TelemetrySample& value) {
         }
     }
 }
+std::string DurableOutbox::unclaimed_filter() const {
+    std::string condition="1";
+    for(const auto& [id,value]:claimed_){(void)value;condition+=" AND id<>"+identity(id);}
+    return condition;
+}
+std::optional<TelemetrySample> DurableOutbox::claim_locked(std::size_t maximum_claims) {
+    if(maximum_claims<1 || maximum_claims>64)throw std::invalid_argument("claim window must be1..64");
+    if(claimed_.size()>=maximum_claims)return std::nullopt;
+    const unsigned weights[]{0,1,0,1,0,2,0};
+    const auto attempts=priorities_?7U:1U;
+    for(unsigned attempt=0;attempt<attempts;++attempt) {
+        const auto category=weights[service_cursor_++%7];
+        auto row=prepare(db_,"SELECT id,frame FROM samples WHERE "+unclaimed_filter()+(priorities_?" AND priority="+std::to_string(category):"")+" ORDER BY id LIMIT 1");
+        const auto status=sqlite3_step(row.get());
+        if(status==SQLITE_DONE)continue;
+        if(status!=SQLITE_ROW)throw std::runtime_error("outbox claim failed");
+        const auto id=static_cast<std::uint64_t>(sqlite3_column_int64(row.get(),0));
+        auto value=sample(row.get(),1);claimed_.emplace(id,value);return value;
+    }
+    return std::nullopt;
+}
 std::optional<TelemetrySample> DurableOutbox::claim() {
     std::lock_guard lock(mutex_);
-    auto row=prepare(db_,"SELECT id,frame FROM samples"+(claimed_?" WHERE id="+identity(*claimed_):" ORDER BY id LIMIT 1"));
-    const auto status=sqlite3_step(row.get());
-    if(status==SQLITE_DONE)return std::nullopt;
-    if(status!=SQLITE_ROW)throw std::runtime_error("outbox claim failed");
-    claimed_=static_cast<std::uint64_t>(sqlite3_column_int64(row.get(),0));
-    return sample(row.get(),1);
+    if(!claimed_.empty())return claimed_.begin()->second;
+    return claim_locked(1);
 }
-void DurableOutbox::acknowledge(const TelemetrySample& value) {
+std::optional<TelemetrySample> DurableOutbox::claim_next(std::size_t maximum_claims) {
+    std::lock_guard lock(mutex_);return claim_locked(maximum_claims);
+}
+void DurableOutbox::release_claims(){std::lock_guard lock(mutex_);claimed_.clear();}
+void DurableOutbox::acknowledge(const TelemetrySample& value) {acknowledge_batch({value});}
+void DurableOutbox::acknowledge_batch(const std::vector<TelemetrySample>& samples) {
+    if(samples.empty() || samples.size()>16)throw std::invalid_argument("ACK batch must contain1..16 samples");
     std::lock_guard lock(mutex_);
-    if(!claimed_)throw std::logic_error("outbox ACK without claim");
-    auto row=prepare(db_,"SELECT frame FROM samples WHERE id="+identity(*claimed_));
-    if(sqlite3_step(row.get())!=SQLITE_ROW)throw std::runtime_error("outbox ACK row missing");
-    const auto stored=sample(row.get(),0);row.reset();
-    if(stored.spacecraft_id!=value.spacecraft_id || stored.flight_boot_id!=value.flight_boot_id || stored.telemetry_sequence!=value.telemetry_sequence)throw std::logic_error("outbox ACK identity mismatch");
+    std::vector<std::uint64_t> ids;
+    for(const auto& value:samples) {
+        const auto found=std::find_if(claimed_.begin(),claimed_.end(),[&](const auto& item){const auto& stored=item.second;return stored.spacecraft_id==value.spacecraft_id && stored.flight_boot_id==value.flight_boot_id && stored.telemetry_sequence==value.telemetry_sequence;});
+        if(found==claimed_.end() || std::find(ids.begin(),ids.end(),found->first)!=ids.end())throw std::logic_error("outbox ACK without matching distinct claim");
+        ids.push_back(found->first);
+    }
     exec("BEGIN IMMEDIATE");
-    try {exec("DELETE FROM samples WHERE id="+identity(*claimed_)+"; UPDATE counters SET value=value+1 WHERE name='acked'; COMMIT");}
-    catch(...){if(!sqlite3_get_autocommit(db_))sqlite3_exec(db_,"ROLLBACK",nullptr,nullptr,nullptr);throw;}
-    claimed_.reset();++popped_;
+    try {
+        for(const auto id:ids)exec("DELETE FROM samples WHERE id="+identity(id));
+        exec("UPDATE counters SET value=value+"+std::to_string(ids.size())+" WHERE name='acked'; COMMIT");
+    }catch(...) {
+        if(!sqlite3_get_autocommit(db_))sqlite3_exec(db_,"ROLLBACK",nullptr,nullptr,nullptr);
+        throw;
+    }
+    for(const auto id:ids)claimed_.erase(id);
+    popped_+=ids.size();
 }
 std::optional<DurableLoss> DurableOutbox::claim_loss() {
     std::lock_guard lock(mutex_);auto reports=losses_locked();
@@ -178,6 +290,9 @@ void DurableOutbox::acknowledge_loss(std::uint64_t id) {
 RetentionQueueSnapshot DurableOutbox::snapshot() const {
     std::lock_guard lock(mutex_);
     return {capacity_,static_cast<std::size_t>(scalar("SELECT count(*) FROM samples")),high_watermark_,accepted_,popped_,0,dropped_,0,false};
+}
+std::uint64_t DurableOutbox::synchronous_mode() const {
+    std::lock_guard lock(mutex_);return scalar("PRAGMA synchronous");
 }
 DurableAccounting DurableOutbox::accounting() const {
     std::lock_guard lock(mutex_);

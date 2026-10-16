@@ -17,6 +17,7 @@ enum class CommandStatus : std::uint32_t {
 struct FakeDeviceState { bool enabled{true}; std::uint32_t period_ms{100}, generation{7}; bool fault{}; std::uint64_t effects{}; };
 
 struct CommandResult { CommandRequest request; CommandStatus status; std::optional<FakeDeviceState> snapshot{}; std::uint64_t monotonic_ns{}; };
+struct DeviceCommandOutcome { CommandStatus status{CommandStatus::outcome_unknown}; std::optional<FakeDeviceState> state{}; };
 
 // Acquisition alone executes device effects. Network owns session policy.
 // Both work and result queues are bounded; disconnect invalidates queued work.
@@ -26,7 +27,7 @@ class CommandDispatcher {
     std::deque<CommandRequest> work_;
     std::deque<CommandResult> results_;
     FakeDeviceState state_;
-    std::function<CommandStatus(const CommandRequest&)> device_execute_;
+    std::function<DeviceCommandOutcome(const CommandRequest&)> device_execute_;
   public:
     void open(std::uint64_t session) {
         std::lock_guard lock(mutex_);
@@ -41,15 +42,20 @@ class CommandDispatcher {
         if (request.opcode < 1 || request.opcode > 6 ||
             (request.opcode == 3 ? (request.argument < 1 || request.argument > 60'000) : request.argument != 0))
             return CommandStatus::invalid_argument;
-        if(device_execute_ && request.opcode!=3)return CommandStatus::invalid_argument;
         if (work_.size()+results_.size() >= 16) return CommandStatus::queue_full;
         last_sequence_=request.sequence;
         work_.push_back(request);
         return CommandStatus::applied; // accepted; wire completion waits for execute()
     }
     void configure(std::uint32_t period, bool fault=false) { std::lock_guard lock(mutex_); state_.period_ms=period; state_.fault=fault; }
-    void device_backend(std::function<CommandStatus(const CommandRequest&)> execute) {
+    void device_backend(std::function<DeviceCommandOutcome(const CommandRequest&)> execute) {
         std::lock_guard lock(mutex_);device_execute_=std::move(execute);
+    }
+    void device_backend(std::function<CommandStatus(const CommandRequest&)> execute) {
+        device_backend(std::function<DeviceCommandOutcome(const CommandRequest&)>(
+            [execute=std::move(execute)](const CommandRequest& request) {
+                return DeviceCommandOutcome{execute(request),{}};
+            }));
     }
     void close() { open(0); }
     void execute(std::uint64_t now) {
@@ -57,10 +63,13 @@ class CommandDispatcher {
         while (!work_.empty()) {
             auto request=work_.front(); work_.pop_front();
             auto status=CommandStatus::applied;
+            bool authoritative_state=false;
             if (request.deadline_ns <= now) status=CommandStatus::expired;
             else if(device_execute_) {
-                status=device_execute_(request);
-                if(status==CommandStatus::applied)state_.period_ms=request.argument;
+                const auto outcome=device_execute_(request);
+                status=outcome.status;
+                if(status==CommandStatus::applied && outcome.state) {state_=*outcome.state;authoritative_state=true;}
+                else if(status==CommandStatus::applied && request.opcode==3)state_.period_ms=request.argument;
             }
             else switch (request.opcode) {
                 case 1: state_.enabled=true; break;
@@ -69,7 +78,7 @@ class CommandDispatcher {
                 case 4: ++state_.generation; break;
                 case 5: state_.fault=false; break;
             }
-            if(status==CommandStatus::applied && request.opcode != 6) ++state_.effects;
+            if(status==CommandStatus::applied && request.opcode != 6 && !authoritative_state) ++state_.effects;
             results_.push_back({request,status, request.opcode==6 && status==CommandStatus::applied ? std::optional<FakeDeviceState>(state_) : std::nullopt, now});
         }
     }

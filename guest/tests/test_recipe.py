@@ -9,9 +9,36 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from guest import VERSIONS, command, validate_source, prepare_state
 from smoke import assert_summary, Console
+from run_m7_gate import validate_memory
 
 
 class RecipeTests(unittest.TestCase):
+    def test_sensor_device_tree_binding_matches_board_allocation(self):
+        schema = (ROOT.parent / 'driver/bindings/orbital,multisensor-v2.yaml').read_text()
+        patcher = (ROOT.parent / 'qemu/apply.py').read_text()
+        for value in ['orbital,multisensor-v2', '0x090c0000', '0x1000']:
+            self.assertIn(value, schema)
+        self.assertIn('qemu_fdt_setprop_string', patcher)
+        self.assertIn('"orbital,multisensor-v2"', patcher)
+        self.assertIn('VIRT_ORBIT_SENSORS', patcher)
+
+    def test_guest_memory_gate_requires_coverage(self):
+        summary = {'process_peak_rss_bytes':1024}
+        for text in ['', 'VmRSS: 1 kB\n' * 20]:
+            with self.assertRaises(RuntimeError):
+                validate_memory(text,600,summary)
+
+    def test_guest_memory_gate_rejects_growth(self):
+        with self.assertRaises(RuntimeError):
+            validate_memory('VmRSS: 1024 kB\n' * 30 + 'VmRSS: 40000 kB\n' * 30,
+                            600,{'process_peak_rss_bytes':40000*1024})
+
+    def test_guest_memory_gate_accepts_covered_stable_run(self):
+        result = validate_memory('VmRSS: 8192 kB\n' * 60,600,
+                                 {'process_peak_rss_bytes':8192*1024})
+        self.assertEqual(result['rss_samples'],60)
+        self.assertEqual(result['last_vs_first_quarter_mean_bytes'],0)
+
     def test_existing_persistent_state_is_never_reformatted(self):
         with tempfile.TemporaryDirectory() as tmp:
             work = Path(tmp)

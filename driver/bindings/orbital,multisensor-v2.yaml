@@ -1,0 +1,38 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: "http://devicetree.org/schemas/misc/orbital,multisensor-v2.yaml#"
+$schema: "http://devicetree.org/meta-schemas/core.yaml#"
+
+title: OrbitalLink synthetic multisensor hub
+
+maintainers:
+  - Niket Kakkar
+
+description: |
+  Development-only QEMU MMIO sensor hub used by OrbitalLink. The device exposes
+  one 4 KiB register window and one level-high interrupt.
+
+properties:
+  compatible:
+    const: orbital,multisensor-v2
+  reg:
+    maxItems: 1
+  interrupts:
+    maxItems: 1
+
+required:
+  - compatible
+  - reg
+  - interrupts
+
+additionalProperties: false
+
+examples:
+  - |
+    sensor-hub@90c0000 {
+        compatible = "orbital,multisensor-v2";
+        reg = <0x0 0x090c0000 0x0 0x1000>;
+        interrupts = <0 10 4>;
+    };
+...

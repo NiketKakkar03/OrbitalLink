@@ -57,25 +57,28 @@ int main() {
 
     orbit::CommandDispatcher commands;commands.open(42);
     commands.device_backend([&](const orbit::CommandRequest& request) {
-        assert(request.opcode==3);
+        if(request.opcode!=3)return orbit::CommandStatus::invalid_argument;
         return source.set_rate(request.argument)?orbit::CommandStatus::applied:orbit::CommandStatus::outcome_unknown;
     });
     using Status=orbit::CommandStatus;
-    for(const auto opcode:{1U,2U,4U,5U,6U})
-        assert(commands.submit({42,1,8,1000,opcode,0},true,0)==Status::invalid_argument);
-    assert(mock->rate_calls==1 && !commands.pop_result());
-    assert(commands.submit({42,1,8,1000,3,222},true,0)==Status::applied);
+    std::uint64_t sequence=1;
+    for(const auto opcode:{1U,2U,4U,5U,6U}) {
+        assert(commands.submit({42,sequence++,8,1000,opcode,0},true,0)==Status::applied);
+        commands.execute(10);assert(commands.pop_result()->status==Status::invalid_argument);
+    }
+    assert(mock->rate_calls==1);
+    assert(commands.submit({42,sequence++,8,1000,3,222},true,0)==Status::applied);
     assert(mock->rate_calls==1); // acceptance never runs a device operation
     commands.execute(10);auto applied=commands.pop_result();
     assert(applied && applied->status==Status::applied && mock->rate_calls==2 && mock->period==222 && !applied->snapshot);
     mock->rate_ok=false;
-    assert(commands.submit({42,2,9,1000,3,333},true,0)==Status::applied);
+    assert(commands.submit({42,sequence++,9,1000,3,333},true,0)==Status::applied);
     commands.execute(10);auto failed=commands.pop_result();
     assert(failed && failed->status==Status::outcome_unknown && commands.state().period_ms==222 && commands.state().effects==1);
-    assert(commands.submit({42,3,10,1000,3,444},true,0)==Status::applied);
+    assert(commands.submit({42,sequence++,10,1000,3,444},true,0)==Status::applied);
     commands.execute(1000);auto expired=commands.pop_result();
     assert(expired && expired->status==Status::expired && mock->rate_calls==3);
-    assert(commands.submit({42,4,11,1000,3,555},true,0)==Status::applied);
+    assert(commands.submit({42,sequence++,11,1000,3,555},true,0)==Status::applied);
     commands.close();commands.execute(10);assert(mock->rate_calls==3 && !commands.pop_result());
 #ifndef __linux__
     assert(fails([]{orbit::open_device("/dev/orbit_telemetry");}));

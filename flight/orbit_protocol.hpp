@@ -17,8 +17,9 @@ constexpr std::uint8_t kTelemetrySample = 1;
 constexpr std::uint8_t kTelemetryAck = 2;
 constexpr std::uint8_t kCommandSession = 3, kCommandRequest = 4, kCommandResult = 5;
 constexpr std::uint8_t kStateSnapshot=6, kLossReport=7, kLossAck=8;
+constexpr std::uint8_t kSensorSample=9, kMultisensorSample=9;
 inline std::uint32_t payload_size(std::uint8_t type) {
-    switch(type) { case 1:return 44;case 2:return 20;case 3:return 24;case 4:return 40;case 5:return 32;case 6:return 64;case 7:return 48;case 8:return 20;default:throw std::runtime_error("unsupported message type"); }
+    switch(type) { case 1:return 44;case 2:return 20;case 3:return 24;case 4:return 40;case 5:return 32;case 6:return 64;case 7:return 48;case 8:return 20;case 9:return 76;default:throw std::runtime_error("unsupported message type"); }
 }
 constexpr std::uint16_t kHeaderLength = 28;
 constexpr std::uint32_t kMaxPayloadLength = 4096;
@@ -40,6 +41,9 @@ struct TelemetrySample {
     std::uint64_t timestamp_monotonic_ns{};
     std::int32_t temperature_millideg_c{};
     std::uint32_t voltage_millivolts{};
+    std::uint16_t category{}, schema{1};
+    std::uint32_t quality{};
+    std::array<std::int32_t,8> values{};
 };
 
 struct TelemetryAck {
@@ -111,18 +115,31 @@ inline std::uint64_t read_u64(const std::vector<std::uint8_t>& data, std::size_t
     return value;
 }
 
+inline void validate_sensor(const TelemetrySample& sample) {
+    if(sample.category>6 || sample.schema!=1 || sample.quality>1)throw ProtocolError("invalid sensor category/schema/quality");
+    constexpr unsigned used[]={0,6,3,5,6,3,4};
+    for(unsigned i=used[sample.category];i<8;++i)if(sample.values[i])throw ProtocolError("unused sensor slots must be zero");
+    int boolean=-1;
+    switch(sample.category){case 1:boolean=5;break;case 2:boolean=2;break;case 3:boolean=4;break;case 5:boolean=2;break;}
+    if(boolean>=0 && (sample.values[boolean]<0 || sample.values[boolean]>1))throw ProtocolError("invalid sensor boolean");
+    if(sample.category==6 && (sample.values[0]<1 || sample.values[0]>8 || sample.values[1]<0 || sample.values[1]>2 || sample.values[2]<1 || sample.values[2]>6 || sample.values[3]<1))throw ProtocolError("invalid sensor event");
+    if(!sample.category && sample.quality)throw ProtocolError("legacy quality cannot be encoded");
+}
+
 inline std::vector<std::uint8_t> encode_telemetry_sample(const TelemetrySample& sample,
                                                          std::uint64_t message_sequence = 1) {
+    validate_sensor(sample);
+    const auto type=sample.category?kSensorSample:kTelemetrySample;
     std::vector<std::uint8_t> out;
-    out.reserve(kHeaderLength + kTelemetrySamplePayloadLength);
+    out.reserve(kHeaderLength + payload_size(type));
 
     out.insert(out.end(), kMagic.begin(), kMagic.end());
     out.push_back(kVersion);
-    out.push_back(kTelemetrySample);
+    out.push_back(type);
     append_u16(out, 0);
     append_u16(out, kHeaderLength);
     append_u16(out, 0);
-    append_u32(out, kTelemetrySamplePayloadLength);
+    append_u32(out, payload_size(type));
     append_u64(out, message_sequence);
     append_u32(out, 0);
 
@@ -132,8 +149,13 @@ inline std::vector<std::uint8_t> encode_telemetry_sample(const TelemetrySample& 
     append_u32(out, sample.device_generation);
     append_u32(out, sample.device_sequence);
     append_u64(out, sample.timestamp_monotonic_ns);
-    append_i32(out, sample.temperature_millideg_c);
-    append_u32(out, sample.voltage_millivolts);
+    if(sample.category) {
+        append_u16(out,sample.category);append_u16(out,sample.schema);append_u32(out,sample.quality);
+        for(auto value:sample.values)append_i32(out,value);
+    } else {
+        append_i32(out, sample.temperature_millideg_c);
+        append_u32(out, sample.voltage_millivolts);
+    }
 
     return out;
 }
@@ -206,7 +228,7 @@ inline DecodedFrame decode_frame(const std::vector<std::uint8_t>& frame) {
     const auto message_sequence = read_u64(frame, 16);
     const auto reserved_b = read_u32(frame, 24);
 
-    if (message_type < kTelemetrySample || message_type > kLossAck) {
+    if (message_type < kTelemetrySample || message_type > kSensorSample) {
         throw ProtocolError("unsupported message type");
     }
     if (flags != 0) {
@@ -250,6 +272,16 @@ inline DecodedFrame decode_frame(const std::vector<std::uint8_t>& frame) {
             read_i32(frame, 64),
             read_u32(frame, 68),
         };
+    } else if(message_type==kSensorSample) {
+        auto& sample=decoded.sample;
+        sample.spacecraft_id=read_u32(frame,28);sample.flight_boot_id=read_u64(frame,32);sample.telemetry_sequence=read_u64(frame,40);
+        sample.device_generation=read_u32(frame,48);sample.device_sequence=read_u32(frame,52);sample.timestamp_monotonic_ns=read_u64(frame,56);
+        sample.category=read_u16(frame,64);sample.schema=read_u16(frame,66);sample.quality=read_u32(frame,68);
+        for(unsigned i=0;i<8;++i)sample.values[i]=read_i32(frame,72+i*4);
+        if(!sample.category)throw ProtocolError("sensor frame requires category");
+        validate_sensor(sample);
+        if(sample.category==2)sample.temperature_millideg_c=sample.values[0];
+        if(sample.category==1 && sample.values[0]>=0)sample.voltage_millivolts=static_cast<std::uint32_t>(sample.values[0]);
     } else if (message_type == kTelemetryAck) {
         decoded.ack = TelemetryAck{
             read_u32(frame, 28),
@@ -287,7 +319,7 @@ class FrameParser {
                 throw ProtocolError("unsupported version");
             }
             const auto message_type = buffer_.at(5);
-            if (message_type < kTelemetrySample || message_type > kLossAck) {
+            if (message_type < kTelemetrySample || message_type > kSensorSample) {
                 throw ProtocolError("unsupported message type");
             }
             if (read_u16(buffer_, 6) != 0) {

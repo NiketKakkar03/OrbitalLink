@@ -1,22 +1,26 @@
 # OrbitalLink: project walkthrough
 
 Snapshot: 2026-10-15. The implemented M1–M6 work was merged into `main` at
-`3b3a7f0`. This guide describes the current system and distinguishes it from the
+`3b3a7f0`. Multisensor work is on `feature/multisensor-validation`; its measurements
+and outstanding gates are in [sensor validation](sensor-validation.md).
+This guide describes the current system and distinguishes it from the
 planned final system. The [roadmap](../OrbitalLink_Roadmap.md) remains the design
 plan; historical journal entries describe the state at their own dates.
 
 ## 1. What we are building
 
 OrbitalLink is a secure embedded telemetry and command platform. A simulated
-sensor produces temperature and voltage measurements. Linux exposes those
+sensor produces power, thermal, orientation, health, science and event reports.
+Linux exposes those
 measurements through a character device. A C++ flight application retains them
 locally and sends them to a Python ground station, which stores them in SQLite.
 An authorized operator can send commands in the opposite direction.
 
 “Flight” and “ground” describe software roles. We have not connected a physical
 spacecraft, radio, sensor board or flight-qualified hardware. The current driver
-uses a kernel timer as its test source. The custom QEMU sensor peripheral is the
-next major implementation boundary.
+retains a kernel timer test source for regression tests and adds a custom QEMU
+sensor peripheral with real emulated registers and interrupts. Its values are
+deterministic examples, not a calibrated spacecraft model.
 
 ## 2. Where the programs run
 
@@ -32,8 +36,8 @@ MacBook M1 Pro / macOS
     ├── Buildroot, cross-compiler and Linux-built QEMU
     ├── Python ground station for embedded gates
     └── QEMU ARM64 Linux guest
-        ├── Linux timer-driven test driver
-        ├── /dev/orbit_telemetry
+        ├── custom QEMU multisensor hub → Linux IRQ-driven driver
+        ├── /dev/orbit_sensors (ABI2); legacy /dev/orbit_telemetry (ABI1)
         ├── C++ flight service
         └── persistent SQLite outbox on a separate state disk
 ```
@@ -52,7 +56,7 @@ remain release work. A pinned base image does not freeze apt repositories.
 ## 3. The implemented data path
 
 ```text
-kernel timer → bounded driver FIFO → nonblocking read/poll
+QEMU virtual timer → hardware FIFO → IRQ → bounded driver FIFO → read/poll
     → flight acquisition thread → committed SQLite outbox
     → flight network thread → mutual TLS 1.3
     → Python frame parser → ground SQLite commit → ACK
@@ -62,6 +66,9 @@ kernel timer → bounded driver FIFO → nonblocking read/poll
 The default native source is a deterministic fake device inside flight. Explicit
 `--source device --device /dev/orbit_telemetry` selects the Linux driver. Device
 mode never silently falls back to the fake source after an error.
+`--source scenario` selects the native multisensor simulation;
+`--source sensors` selects the custom peripheral through `/dev/orbit_sensors`.
+Both use the shared category schedule and interaction rules.
 
 The two flight threads separate acquisition from networking. Acquisition owns
 device access and command effects; the network thread owns the TLS connection.
@@ -88,6 +95,10 @@ Every sample carries:
 | temperature | Signed integer millidegrees Celsius |
 | voltage | Unsigned integer millivolts |
 
+The final two fields describe legacy type 1. Typed type 9 samples instead carry
+a category, schema version, quality flags and eight signed integer slots. The
+[sensor contract](../protocol/sensor-contract.md) specifies each category and unit.
+
 For example, `-5250` means −5.250 °C, and `3300` means 3.300 V.
 Monotonic time is useful for ordering within a run; it is not a UTC timestamp
 that can be directly compared across boots. Ground separately records receipt
@@ -107,15 +118,17 @@ The final design has three distinct interfaces:
 |---|---|
 | Network protocol | Implemented: explicit big-endian encoding, not raw C structs |
 | Linux driver UAPI | Implemented: fixed-width guest-native fields and explicit ABI version |
-| QEMU MMIO registers | Planned for M7; not implemented yet |
+| QEMU MMIO registers | Implemented custom ABI2 hub; installed-binary QTest checks passed |
 
 Network frames have a 28-byte header and at most 4,096 payload bytes. The header
 contains `OLNK`, version, type, lengths, sequence and reserved fields. A telemetry
-payload is 44 bytes. The parser handles fragmented/coalesced TCP input and rejects
+payload is 44 bytes for legacy type 1 or 76 bytes for typed type 9. The parser
+handles fragmented/coalesced TCP input and rejects
 malformed headers, sizes, versions and reserved bits.
 
 Current message types are telemetry sample, telemetry ACK, command session,
-command request, command result, state snapshot, loss report and loss ACK.
+command request, command result, state snapshot, loss report, loss ACK and typed
+sensor sample.
 C++ and Python share golden byte fixtures and rejection tests. See the
 [wire specification](../protocol/specification.md).
 
@@ -123,6 +136,8 @@ The Linux UAPI has a 40-byte sample, 56-byte statistics response and 16-byte rat
 request. It exposes read/poll plus `GET_STATS` and `SET_RATE` ioctls. Layout,
 reserved fields and ABI compatibility are checked. These bytes are converted to
 the network representation rather than transmitted as a raw kernel struct.
+The separate ABI2 UAPI uses 64-byte typed records and adds reset, clock calibration
+and event-accounting ioctls; legacy layouts remain supported.
 
 ## 6. What “delivered” guarantees
 
@@ -151,7 +166,8 @@ There are separate loss boundaries:
 
 | Boundary | Limit/policy | Meaning |
 |---|---|---|
-| Driver FIFO | 64 records, drop newest | Preserve records already queued for the reader |
+| Legacy driver FIFO | 64 records, drop newest | Preserve records already queued for the reader |
+| ABI2 hardware/software FIFOs | 64 + 256 records, urgent reserves | Bound the custom sensor pipeline and count losses |
 | Durable flight outbox | Default 64 MiB budget, evict oldest unclaimed | Preserve recent telemetry during an extended outage |
 | Loss metadata | Bounded detail plus aggregate counts | Never make error reporting itself unbounded |
 | Ground database | No application-level archive/size cap implemented | Deployment needs its own disk/archive policy |
@@ -166,12 +182,18 @@ not a measured outage guarantee. Database pages, live rollback journal, schema,
 counters and loss metadata all consume space. `--capacity` can impose a smaller
 record limit, and `--outbox-bytes` accepts 256 KiB through 1 GiB.
 
-An in-flight record awaiting its ACK is protected from eviction. Extremely small
-capacity can therefore stop acquisition; capacity one cannot always admit another
+Each in-flight record awaiting its ACK is protected from eviction. The bounded
+send window accepts 1–64 records; the multisensor profile uses 32. Optional
+priority scheduling reserves urgent capacity and fairly services event,
+operational and science queues; rejected incoming records are also counted.
+Extremely small capacity can stop acquisition in the default legacy mode;
+capacity one cannot always admit another
 sample. Startup refuses a limit reduction below the existing backlog. One process
 owns an outbox through an exclusive lock.
 
-SQLite uses DELETE journal mode, synchronous FULL and macOS fullfsync. A bounded
+SQLite now uses DELETE journal mode, synchronous EXTRA and macOS fullfsync. EXTRA
+adds the directory synchronization needed after journal removal; an actual VM
+power-cut test exposed a lost last commit under the earlier FULL setting. A bounded
 set of retry transactions handles page-cap exhaustion; unresolved storage errors
 fail explicitly instead of reporting success or silently losing committed state.
 The accounting equation across restarts is:
@@ -213,11 +235,11 @@ the old session and queued work.
 
 | Command | Native fake source | Linux device source |
 |---|---|---|
-| enable / disable | Implemented | Rejected: control UAPI still needed |
+| enable / disable | Implemented | Implemented through real ioctl/register effects |
 | set-period, 1–60000 ms | Implemented | Implemented through real ioctl |
-| reset | Implemented | Rejected: control UAPI still needed |
-| clear-fault | Implemented | Rejected: control UAPI still needed |
-| query-state | Implemented, read-only | Rejected: truthful state UAPI still needed |
+| reset | Implemented | Implemented through real ioctl/register effects |
+| clear-fault | Implemented | Implemented through real ioctl/register effects |
+| query-state | Implemented, read-only | Reports actual enable/rate/generation/fault/reset state through ioctl |
 
 A device rate command reports applied only after its ioctl succeeds. An uncertain
 failure is not represented as simulated success. If a connection disappears
@@ -263,48 +285,64 @@ a sustained-throughput benchmark. See [driver details](driver.md).
 | M4 security/control | Mutual TLS, identity authorization, native commands and replay/deadline policy tested |
 | M5 guest | Passed two real boots: 7 retained samples + 100 new = 107 ground rows across two boot IDs |
 | M6 driver test source | Passed syscall/lifecycle gate and 100 driver-origin TLS samples |
-| M7 custom peripheral | Not implemented |
-| M8 fault/measurement | Native evidence runner and initial guest gates implemented; full matrix/benchmarks pending |
-| M9 release | Pending clean-checkout release/reproduction and operational/security work |
+| M7 custom peripheral | Complete: ABI2 hub/IRQ driver, binding schema, controls/state UAPI, QTest, driver rebind contract, EXTRA-durable baseline and abrupt-power-cut recovery passed |
+| M8 fault/measurement | Complete: deterministic device fault matrix, durable kernel-loss reporting, native and embedded baselines, overload/recovery, abrupt power cuts and measured 100 Hz limit |
+| M9 release | Release preparation implemented: licensing, clean-build procedure, archive/certificate/upgrade runbook and artifact checklist; publication remains an explicit operator action |
 
-The native suite contains 140 Python tests plus five passing recipe tests and
-one environment-dependent skip in the local run, C++ checks and a driver host
-ABI/FIFO check. ASan/UBSan and macOS TSan checks passed. CI runs Ubuntu and macOS;
+The native suite includes protocol/storage, recovery, typed sensors, bounded
+windows and overload tests, C++ checks and driver host ABI/FIFO checks.
+ASan/UBSan and macOS TSan checks are part of validation. CI runs Ubuntu and macOS;
 it does not yet rebuild and execute the entire guest/module matrix remotely.
 
 Validated implementation commit `3b3a7f0` passed
 [CI run 38752529854](https://github.com/NiketKakkar03/OrbitalLink/actions/runs/38752529854).
+The final multisensor implementation `66c3d6d` passed
+[CI run 38846899940](https://github.com/NiketKakkar03/OrbitalLink/actions/runs/38846899940)
+on Ubuntu and macOS. A separately identified embedded image passed an
+EXTRA-durable 600-second baseline with 6,060 reports, zero source/outbox drops
+and source-to-ACK p95 at most 389 ms. Three abrupt-power-cut cycles preserved and
+replayed every committed typed record. See
+[sensor validation](sensor-validation.md) for exact tested-image identities and
+the separate native and embedded results.
 Local embedded evidence is retained, ignored by Git, at:
 
 - `build/guest-evidence/m5-run-005/`: result, manifest and both serial runs.
 - `build/guest-evidence/m6-run-001/`: result, manifest, executable hashes, serial
   output and extracted syscall/lifecycle/kernel artifacts.
+- `build/guest-evidence/m7-baseline-001/`: custom-device contract, 600-second
+  typed run, clock/resource measurements and image manifest.
+- `build/guest-evidence/m7-extra-baseline-001/`: final EXTRA-durable 600-second
+  typed run, raw serial/resource data, ground database and exact image manifest.
+- `build/guest-evidence/m7-controls-001/`: rebuilt ARM64 image, ABI2 control/state
+  syscall contract and short authenticated sensor-path regression.
 
 These directories contain no copied private keys. They are local evidence,
 not a published release archive. Earlier failed attempts were preserved in the
 Linux build volume. A passing gate means those scenarios passed on that build;
 it does not establish correctness for every fault or deployment.
 
-## 11. Remaining design to implement
+## 11. Completed scope and later extensions
 
-M7 replaces the timer test source with a custom QEMU peripheral: coherent latched
-samples, explicit little-endian MMIO registers, a level-triggered IRQ, ACK/mask
-semantics, overrun/reset observability, a deterministic virtual timer and device
-tree wiring. The driver must bind to the real emulated resource/IRQ. The roadmap's
-register/interrupt ideas remain proposals until specified and tested against the
-selected QEMU machine source; no MMIO address or IRQ is frozen by this guide.
+The custom hub now implements coherent latched samples, little-endian MMIO,
+a level-triggered IRQ, masking, overrun/reset accounting, a deterministic
+virtual timer and machine-generated device-tree wiring. Its maintained patch
+uses MMIO 0x090c0000 and GIC SPI 10 (INTID 42) on pinned virt-9.2. The driver binds
+to these real emulated resources. Complete roadmap acceptance, negative probe
+and binding-schema coverage should be checked separately from a passing data path.
 
-Driver control/state UAPI must then support real enable/disable/reset/clear-fault
-and truthful query-state, with the existing authorization/replay/deadline rules
-preserved through ioctl and register effects.
+The driver control/state UAPI now supports real enable/disable/reset/clear-fault
+and truthful query-state. The existing authorization/replay/deadline rules feed
+these ioctl/register effects through the acquisition-owned command dispatcher.
 
-M8 still needs abrupt guest-power-loss tests, physical-disk/storage fault
-scenarios, the full embedded network/device fault matrix, kernel-loss reporting,
-rate/backpressure calibration, throughput/latency/resource measurements and
-repeated stress evidence. M9 needs clean-checkout reproduction, patch/license
-review, release artifacts, deployment/credential operations, ground archive policy
-and a documented demonstration. Yocto is a later extension after the first
-Buildroot-based release, not a completed component.
+M8 now covers the deterministic embedded fault modes, persistent reporting of
+driver/hardware drops, network replay faults, storage-full transaction rollback,
+hot-journal recovery, three abrupt guest power cuts, bounded stress and measured
+throughput/latency/resource behavior. The supported embedded baseline remains
+10 Hz. The 100 Hz experiment retained its backlog but exceeded real-time capacity.
+Physical media failure, calibrated sensor physics and live VM migration require
+hardware or platform-specific campaigns outside this repository. M9's operating
+procedure is in [release operations](release.md). Yocto remains a later extension
+after the first Buildroot-based release.
 
 ## 12. How to explore and run it
 
@@ -341,6 +379,6 @@ and embedded commands. Large builds and state live in the named Linux volume
 preserved. The normal root disk uses a snapshot, while the separate ext4 state
 disk deliberately persists the outbox across VM boots.
 
-The project now has a tested path from a Linux kernel test source to authenticated
-durable ground storage. The next boundary to learn and implement is the actual
-emulated sensor's registers and interrupt behavior.
+The project has authenticated durable telemetry from native and emulated-device
+sources. See [sensor validation](sensor-validation.md) for the current measurement
+results and the remaining fault, performance and release gates.

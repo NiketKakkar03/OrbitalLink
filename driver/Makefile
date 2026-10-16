@@ -17,6 +17,7 @@ clean:
 else
 ifeq ($(ORBIT_TEST_BACKEND),1)
 obj-m += orbit_test.o
+obj-m += orbit_sensors.o
 ifeq ($(ORBIT_KUNIT),1)
 obj-m += orbit_queue_test.o
 endif

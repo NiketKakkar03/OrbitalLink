@@ -15,6 +15,10 @@ COMMAND_RESULT = 5
 STATE_SNAPSHOT = 6
 LOSS_REPORT = 7
 LOSS_ACK = 8
+SENSOR_SAMPLE = 9
+MULTISENSOR_SAMPLE = SENSOR_SAMPLE
+CATEGORY_NAMES = {0: "legacy", 1: "power", 2: "thermal", 3: "orientation", 4: "health", 5: "science", 6: "event"}
+SENSOR_SAMPLE_STRUCT = struct.Struct("!IQQIIQHHI8i")
 TELEMETRY_SAMPLE_PAYLOAD_LENGTH = 44
 TELEMETRY_ACK_PAYLOAD_LENGTH = 20
 
@@ -44,6 +48,10 @@ class TelemetrySample:
     timestamp_monotonic_ns: int
     temperature_millideg_c: int
     voltage_millivolts: int
+    category: int = 0
+    schema: int = 1
+    quality: int = 0
+    values: tuple[int, ...] = (0,) * 8
 
 
 @dataclass(frozen=True)
@@ -91,7 +99,30 @@ def encode_control(kind: int, payload: bytes, message_sequence: int = 1) -> byte
                               len(payload), message_sequence, 0) + payload
 
 
+def validate_sensor(sample):
+    def integer(value, low, high):
+        return isinstance(value, int) and not isinstance(value, bool) and low <= value <= high
+    if not integer(sample.category, 0, 6) or not integer(sample.schema, 1, 1) or not integer(sample.quality, 0, 1):
+        raise ProtocolError("invalid sensor category/schema/quality")
+    if len(sample.values) != 8 or any(not integer(v, -(1<<31), (1<<31)-1) for v in sample.values):
+        raise ProtocolError("invalid sensor values")
+    used = (0, 6, 3, 5, 6, 3, 4)[sample.category]
+    if any(sample.values[used:]):
+        raise ProtocolError("unused sensor slots must be zero")
+    boolean = {1: 5, 2: 2, 3: 4, 5: 2}.get(sample.category)
+    if boolean is not None and sample.values[boolean] not in (0, 1):
+        raise ProtocolError("invalid sensor boolean")
+    if sample.category == 6 and (not 1 <= sample.values[0] <= 8 or not 0 <= sample.values[1] <= 2 or not 1 <= sample.values[2] <= 6 or sample.values[3] < 1):
+        raise ProtocolError("invalid sensor event")
+    if sample.category == 0 and sample.quality:
+        raise ProtocolError("legacy quality cannot be encoded")
+
+
 def encode_telemetry_sample(sample: TelemetrySample, message_sequence: int = 1) -> bytes:
+    validate_sensor(sample)
+    if sample.category:
+        payload = SENSOR_SAMPLE_STRUCT.pack(sample.spacecraft_id, sample.flight_boot_id, sample.telemetry_sequence, sample.device_generation, sample.device_sequence, sample.timestamp_monotonic_ns, sample.category, sample.schema, sample.quality, *sample.values)
+        return HEADER_STRUCT.pack(MAGIC, VERSION, SENSOR_SAMPLE, 0, HEADER_LENGTH, 0, len(payload), message_sequence, 0) + payload
     payload = TELEMETRY_SAMPLE_STRUCT.pack(
         sample.spacecraft_id,
         sample.flight_boot_id,
@@ -160,7 +191,7 @@ def decode_frame(frame: bytes) -> tuple[Header, TelemetrySample | TelemetryAck]:
         raise ProtocolError("bad magic")
     if version != VERSION:
         raise ProtocolError("unsupported version")
-    if message_type not in (TELEMETRY_SAMPLE, TELEMETRY_ACK, COMMAND_SESSION, COMMAND_REQUEST, COMMAND_RESULT, STATE_SNAPSHOT, LOSS_REPORT, LOSS_ACK):
+    if message_type not in (TELEMETRY_SAMPLE, TELEMETRY_ACK, COMMAND_SESSION, COMMAND_REQUEST, COMMAND_RESULT, STATE_SNAPSHOT, LOSS_REPORT, LOSS_ACK, SENSOR_SAMPLE):
         raise ProtocolError("unsupported message type")
     if flags != 0:
         raise ProtocolError("unsupported flags")
@@ -173,7 +204,7 @@ def decode_frame(frame: bytes) -> tuple[Header, TelemetrySample | TelemetryAck]:
     expected_payload_length = {
         TELEMETRY_SAMPLE: TELEMETRY_SAMPLE_PAYLOAD_LENGTH,
         TELEMETRY_ACK: TELEMETRY_ACK_PAYLOAD_LENGTH,
-        COMMAND_SESSION: 24, COMMAND_REQUEST: 40, COMMAND_RESULT: 32, STATE_SNAPSHOT: 64, LOSS_REPORT: 48, LOSS_ACK: 20,
+        COMMAND_SESSION: 24, COMMAND_REQUEST: 40, COMMAND_RESULT: 32, STATE_SNAPSHOT: 64, LOSS_REPORT: 48, LOSS_ACK: 20, SENSOR_SAMPLE: 76,
     }[message_type]
     if payload_length != expected_payload_length:
         if message_type == TELEMETRY_SAMPLE:
@@ -206,6 +237,13 @@ def decode_frame(frame: bytes) -> tuple[Header, TelemetrySample | TelemetryAck]:
             temperature_millideg_c=values[6],
             voltage_millivolts=values[7],
         )
+    elif message_type == SENSOR_SAMPLE:
+        fields = SENSOR_SAMPLE_STRUCT.unpack(payload)
+        category, schema, quality, *slots = fields[6:]
+        message = TelemetrySample(*fields[:6], slots[0] if category == 2 else 0, max(0, slots[0]) if category == 1 else 0, category, schema, quality, tuple(slots))
+        if not category:
+            raise ProtocolError("sensor frame requires a category")
+        validate_sensor(message)
     elif message_type == TELEMETRY_ACK:
         values = TELEMETRY_ACK_STRUCT.unpack(payload)
         message = TelemetryAck(
@@ -256,7 +294,7 @@ class FrameParser:
                 raise ProtocolError("bad magic")
             if version != VERSION:
                 raise ProtocolError("unsupported version")
-            if message_type not in (TELEMETRY_SAMPLE, TELEMETRY_ACK, COMMAND_SESSION, COMMAND_REQUEST, COMMAND_RESULT, STATE_SNAPSHOT, LOSS_REPORT, LOSS_ACK):
+            if message_type not in (TELEMETRY_SAMPLE, TELEMETRY_ACK, COMMAND_SESSION, COMMAND_REQUEST, COMMAND_RESULT, STATE_SNAPSHOT, LOSS_REPORT, LOSS_ACK, SENSOR_SAMPLE):
                 raise ProtocolError("unsupported message type")
             if flags != 0:
                 raise ProtocolError("unsupported flags")
@@ -269,7 +307,7 @@ class FrameParser:
             expected_payload_length = {
                 TELEMETRY_SAMPLE: TELEMETRY_SAMPLE_PAYLOAD_LENGTH,
                 TELEMETRY_ACK: TELEMETRY_ACK_PAYLOAD_LENGTH,
-                COMMAND_SESSION: 24, COMMAND_REQUEST: 40, COMMAND_RESULT: 32, STATE_SNAPSHOT: 64, LOSS_REPORT: 48, LOSS_ACK: 20,
+                COMMAND_SESSION: 24, COMMAND_REQUEST: 40, COMMAND_RESULT: 32, STATE_SNAPSHOT: 64, LOSS_REPORT: 48, LOSS_ACK: 20, SENSOR_SAMPLE: 76,
             }[message_type]
             if payload_length != expected_payload_length:
                 if message_type == TELEMETRY_SAMPLE:

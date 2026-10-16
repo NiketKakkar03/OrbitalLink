@@ -102,7 +102,7 @@ def test_rejected_clients_insert_no_samples(tmp_path, certificates, mode):
                 else:
                     context.load_default_certs()
                     context.load_cert_chain(certificates / "flight.pem", certificates / "flight.key")
-                with pytest.raises((ssl.SSLError, ConnectionResetError)):
+                with pytest.raises((ssl.SSLError, ConnectionResetError, BrokenPipeError)):
                     with context.wrap_socket(raw, server_hostname="ground.orbital.test") as connection:
                         connection.sendall(b"OLNK" + b"\0" * 68)
                         connection.recv(100)
@@ -125,7 +125,7 @@ def test_foreign_ca_client_rejected_by_server(tmp_path, certificates):
         context.minimum_version = ssl.TLSVersion.TLSv1_3
         context.load_cert_chain(foreign / "flight.pem", foreign / "flight.key")
         with socket.create_connection(("127.0.0.1", port), timeout=2) as raw:
-            with pytest.raises((ssl.SSLError, ConnectionResetError)):
+            with pytest.raises((ssl.SSLError, ConnectionResetError, BrokenPipeError)):
                 with context.wrap_socket(raw, server_hostname="ground.orbital.test") as connection:
                     connection.sendall(b"OLNK" + b"\0" * 68)
                     connection.recv(100)

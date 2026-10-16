@@ -103,11 +103,13 @@ class FaultGround:
         expected_unique: int,
         first_ack: str = "normal",
         start_reading: threading.Event | None = None,
+        batch_receipts: bool = False,
     ):
         self.database = database
         self.expected_unique = expected_unique
         self.first_ack = first_ack
         self.start_reading = start_reading
+        self.batch_receipts = batch_receipts
         self.listener = socket.socket()
         self.listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.listener.bind(("127.0.0.1", 0))
@@ -158,7 +160,24 @@ class FaultGround:
                             break
                         if not chunk:
                             break
-                        for header, message in parser.feed(chunk):
+                        decoded = parser.feed(chunk)
+                        if self.batch_receipts and decoded:
+                            assert self.first_ack == "normal"
+                            for start in range(0, len(decoded), 16):
+                                group = decoded[start:start + 16]
+                                records = []
+                                for _header, sample in group:
+                                    assert isinstance(sample, TelemetrySample)
+                                    records.append((sample, True, None))
+                                storage.store_samples(records)
+                                for header, message in group:
+                                    self.frames += 1
+                                    connection.sendall(encode_telemetry_ack(
+                                        TelemetryAck(message.spacecraft_id, message.flight_boot_id,
+                                                     message.telemetry_sequence),
+                                        header.message_sequence))
+                            continue
+                        for header, message in decoded:
                             assert isinstance(message, TelemetrySample)
                             storage.store_sample(message)
                             self.frames += 1
@@ -246,18 +265,20 @@ def test_accelerated_30_second_logical_outage_recovers_without_loss(
     # workload at 1 ms/sample, then expose ground after acquisition completes.
     port = unused_port()
     database = tmp_path / "short-outage.db"
+    outbox = tmp_path / "short-outage-outbox.db"
     process = subprocess.Popen(
         [
             str(flight_service), "127.0.0.1", str(port),
             "--count", "300", "--interval-ms", "1", "--capacity", "1024",
-            "--connect-timeout-ms", "25", "--io-timeout-ms", "75", "--drain-ms", "2500",
+            "--outbox", str(outbox), "--send-window", "32", "--storage-batch", "16",
+            "--connect-timeout-ms", "25", "--io-timeout-ms", "75", "--drain-ms", "3000",
         ],
         cwd=PROJECT_ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )
     time.sleep(0.4)
     # FaultGround normally selects a port; replace its pre-bound listener so it
     # starts on the port the already-running flight process is retrying.
-    ground = FaultGround(database, expected_unique=300)
+    ground = FaultGround(database, expected_unique=300, batch_receipts=True)
     ground.listener.close()
     ground.listener = socket.socket()
     ground.listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -266,7 +287,7 @@ def test_accelerated_30_second_logical_outage_recovers_without_loss(
     ground.listener.settimeout(0.1)
     ground.port = port
     with ground:
-        stdout, stderr = process.communicate(timeout=6)
+        stdout, stderr = process.communicate(timeout=10)
         assert process.returncode == 0, stderr
         counters = json.loads(stdout)
 

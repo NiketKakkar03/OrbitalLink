@@ -14,6 +14,12 @@ using orbit::DurableOutbox;
 orbit::TelemetrySample make_sample(std::uint64_t sequence,std::uint64_t boot=UINT64_MAX) {
     return {42,boot,sequence,7,static_cast<std::uint32_t>(sequence),123456789,21500,3300};
 }
+orbit::TelemetrySample make_sensor(std::uint64_t sequence,std::uint16_t category) {
+    auto value=make_sample(sequence);value.category=category;
+    if(category==6)value.values={1,1,1,1,0,0,0,0};
+    if(category==5)value.values={1,1000,0,0,0,0,0,0};
+    return value;
+}
 extern char** environ;
 
 pid_t spawn_helper(const std::string& executable,const std::string& mode,const std::string& path,int write_fd=-1,int close_fd=-1) {
@@ -89,6 +95,7 @@ int main(int argc,char** argv) {
     const auto path=(directory/"outbox.db").string();
     {
         DurableOutbox outbox(path,262144,2);
+        assert(outbox.synchronous_mode()==3);
         outbox.push(make_sample(0));outbox.push(make_sample(1));
         const auto claimed=outbox.claim();assert(claimed && claimed->telemetry_sequence==0);
         const auto dropped=outbox.push(make_sample(2));
@@ -100,6 +107,7 @@ int main(int argc,char** argv) {
     }
     {
         DurableOutbox outbox(path,262144,2);
+        assert(outbox.synchronous_mode()==3);
         auto first=outbox.claim();assert(first && orbit::encode_telemetry_sample(*first,0)==orbit::encode_telemetry_sample(make_sample(0),0));
         bool mismatch=false;
         try {outbox.acknowledge(make_sample(9));}catch(const std::exception&){mismatch=true;}
@@ -132,6 +140,15 @@ int main(int argc,char** argv) {
         DurableOutbox outbox(path,262144,2);auto next=outbox.claim();assert(next && next->flight_boot_id==123);outbox.acknowledge(*next);
     }
     // Actual physical DB budget bounds storage, even with an enormous count cap.
+    {
+        DurableOutbox outbox((directory/"aggregate-loss.db").string(),262144,8);
+        outbox.record_aggregate_loss(7);outbox.record_aggregate_loss(5);
+        const auto reports=outbox.losses();
+        assert(reports.size()==1 && !reports[0].detail_complete && !reports[0].boot_id &&
+               !reports[0].first && !reports[0].last && reports[0].count==12);
+        const auto claimed=outbox.claim_loss();assert(claimed && claimed->count==12);
+        outbox.acknowledge_loss(claimed->id);assert(outbox.losses().empty());
+    }
     const auto bounded=(directory/"bounded.db").string();
     {
         DurableOutbox outbox(bounded,262144,1000000);
@@ -219,6 +236,130 @@ int main(int argc,char** argv) {
             recovered.acknowledge(*next);
         }
         assert(recovered.snapshot().size==0);
+    }
+    // Window claims are distinct, protected and ACKed by exact identity even
+    // out of order. Reconnect releases only claims, never durable rows.
+    {
+        DurableOutbox outbox((directory/"window.db").string(),1024*1024,64,true);
+        for(std::uint64_t index=0;index<8;++index) {
+            outbox.push(make_sensor(index*3,6));outbox.push(make_sensor(index*3+1,4));outbox.push(make_sensor(index*3+2,5));
+        }
+        std::vector<orbit::TelemetrySample> claimed;
+        unsigned urgent=0,operational=0,bulk=0;
+        for(unsigned index=0;index<7;++index) {
+            const auto next=outbox.claim_next(7);assert(next);claimed.push_back(*next);
+            if(next->category==6)++urgent;else if(next->category==5)++bulk;else ++operational;
+        }
+        assert(urgent==4 && operational==2 && bulk==1 && !outbox.claim_next(7));
+        assert(outbox.snapshot().size==24);
+        outbox.acknowledge(claimed.back());assert(outbox.snapshot().size==23);
+        bool duplicate=false;try{outbox.acknowledge(claimed.back());}catch(const std::logic_error&){duplicate=true;}
+        assert(duplicate);
+        outbox.release_claims();
+        std::vector<std::uint64_t> replayed;
+        while(auto next=outbox.claim_next(64))replayed.push_back(next->telemetry_sequence);
+        assert(replayed.size()==23);
+        for(const auto& previous:claimed)if(previous.telemetry_sequence!=claimed.back().telemetry_sequence)
+            assert(std::find(replayed.begin(),replayed.end(),previous.telemetry_sequence)!=replayed.end());
+        bool bad_window=false;try{outbox.claim_next(65);}catch(const std::invalid_argument&){bad_window=true;}
+        assert(bad_window);
+    }
+    // Bulk cannot consume the urgent reserve. Even a fully claimed window
+    // never loses its immutable frames when another urgent event arrives.
+    {
+        DurableOutbox outbox((directory/"reserve.db").string(),1024*1024,8,true);
+        for(std::uint64_t index=0;index<8;++index)outbox.push(make_sensor(index,5));
+        assert(outbox.snapshot().size==7 && outbox.accounting().dropped==1);
+        for(unsigned index=0;index<7;++index)assert(outbox.claim_next(8));
+        assert(outbox.push(make_sensor(8,6)).empty());
+        auto urgent=outbox.claim_next(8);assert(urgent && urgent->category==6);
+        const auto dropped=outbox.push(make_sensor(9,6));
+        assert(dropped.size()==1 && dropped.front().telemetry_sequence==9);
+        assert(outbox.snapshot().size==8 && outbox.accounting().generated==10 && outbox.accounting().dropped==2);
+        outbox.acknowledge(*urgent);assert(outbox.snapshot().size==7);
+    }
+    // Enabling priority on an existing FIFO backlog rederives scheduling keys
+    // from unchanged payloads, including typedrows stored by a FIFO owner.
+    const auto mode_path=(directory/"mode-change.db").string();
+    const std::vector<orbit::TelemetrySample> mode_samples{make_sensor(100,5),make_sensor(101,4),make_sensor(102,6),make_sample(103)};
+    {
+        DurableOutbox fifo(mode_path,1024*1024,16,false);
+        for(const auto& value:mode_samples)fifo.push(value);
+    }
+    {
+        DurableOutbox priority(mode_path,1024*1024,16,true);
+        const auto urgent=priority.claim_next(4);assert(urgent && urgent->category==6 && urgent->telemetry_sequence==102);
+        std::vector<orbit::TelemetrySample> replay{*urgent};
+        while(auto next=priority.claim_next(4))replay.push_back(*next);
+        assert(replay.size()==mode_samples.size());
+        for(const auto& original:mode_samples) {
+            const auto found=std::find_if(replay.begin(),replay.end(),[&](const auto& value){return value.telemetry_sequence==original.telemetry_sequence;});
+            assert(found!=replay.end() && orbit::encode_telemetry_sample(*found,0)==orbit::encode_telemetry_sample(original,0));
+        }
+        const auto counts=priority.accounting();assert(counts.generated==4 && counts.retained==4 && counts.dropped==0 && counts.acknowledged==0 && priority.losses().empty());
+    }
+    {
+        DurableOutbox fifo_again(mode_path,1024*1024,16,false);
+        const auto first=fifo_again.claim();assert(first && first->category==5 && first->telemetry_sequence==100);
+    }
+    {
+        DurableOutbox priority_again(mode_path,1024*1024,16,true);
+        assert(priority_again.claim()->telemetry_sequence==102);
+    }
+    // A failure halfway through reclassification rolls back all scheduling
+    // changes. It cannot alter payloads or cumulative delivery accounting.
+    const auto failed_mode=(directory/"mode-failure.db").string();
+    {
+        DurableOutbox fifo(failed_mode,1024*1024,16,false);
+        fifo.push(make_sensor(200,5));fifo.push(make_sensor(201,6));
+    }
+    sqlite3* failed_db{};assert(sqlite3_open(failed_mode.c_str(),&failed_db)==SQLITE_OK);
+    assert(sqlite3_exec(failed_db,"CREATE TRIGGER reject_reclassification BEFORE UPDATE OF priority ON samples WHEN OLD.id=2 BEGIN SELECT RAISE(ABORT,'injected priority migration failure'); END",nullptr,nullptr,nullptr)==SQLITE_OK);
+    sqlite3_close(failed_db);
+    bool rebuild_failed=false;
+    try{DurableOutbox priority(failed_mode,1024*1024,16,true);}catch(const std::exception&){rebuild_failed=true;}
+    assert(rebuild_failed);
+    assert(sqlite3_open(failed_mode.c_str(),&failed_db)==SQLITE_OK);
+    sqlite3_stmt* priorities{};
+    assert(sqlite3_prepare_v2(failed_db,"SELECT priority FROM samples ORDER BY id",-1,&priorities,nullptr)==SQLITE_OK);
+    assert(sqlite3_step(priorities)==SQLITE_ROW && sqlite3_column_int(priorities,0)==1);
+    assert(sqlite3_step(priorities)==SQLITE_ROW && sqlite3_column_int(priorities,0)==1);
+    sqlite3_finalize(priorities);sqlite3_close(failed_db);
+    {
+        DurableOutbox preserved(failed_mode,1024*1024,16,false);
+        const auto counts=preserved.accounting();assert(counts.generated==2 && counts.retained==2 && counts.dropped==0 && counts.acknowledged==0);
+        assert(preserved.claim()->telemetry_sequence==200);
+    }
+    // Batched deletion is one atomic durable boundary. Invalid, duplicate and
+    // failed batches preserve every claim; only a successful COMMIT counts ACKs.
+    const auto ack_batch_path=(directory/"ack-batch.db").string();
+    {
+        DurableOutbox outbox(ack_batch_path,1024*1024,8,true);
+        for(std::uint64_t sequence=300;sequence<308;++sequence)outbox.push(make_sensor(sequence,6));
+        std::vector<orbit::TelemetrySample> claims;
+        for(unsigned index=0;index<8;++index){auto value=outbox.claim_next(8);assert(value);claims.push_back(*value);}
+        bool rejected=false;
+        try{outbox.acknowledge_batch({claims[0],make_sensor(999,6)});}catch(const std::logic_error&){rejected=true;}
+        assert(rejected && outbox.accounting().acknowledged==0 && outbox.snapshot().size==8);
+        rejected=false;
+        try{outbox.acknowledge_batch({claims[0],claims[0]});}catch(const std::logic_error&){rejected=true;}
+        assert(rejected && outbox.accounting().acknowledged==0);
+        sqlite3* db{};assert(sqlite3_open(ack_batch_path.c_str(),&db)==SQLITE_OK);
+        assert(sqlite3_exec(db,"CREATE TRIGGER reject_ack_batch BEFORE DELETE ON samples WHEN OLD.id=2 BEGIN SELECT RAISE(ABORT,'injected ACK batch failure'); END",nullptr,nullptr,nullptr)==SQLITE_OK);
+        sqlite3_close(db);
+        rejected=false;
+        try{outbox.acknowledge_batch({claims[0],claims[1],claims[2]});}catch(const std::runtime_error&){rejected=true;}
+        assert(rejected && outbox.accounting().acknowledged==0 && outbox.snapshot().size==8);
+        const auto displaced=outbox.push(make_sensor(308,6));
+        assert(displaced.size()==1 && displaced[0].telemetry_sequence==308); // All eight claims remain protected.
+        assert(sqlite3_open(ack_batch_path.c_str(),&db)==SQLITE_OK);
+        assert(sqlite3_exec(db,"DROP TRIGGER reject_ack_batch",nullptr,nullptr,nullptr)==SQLITE_OK);
+        sqlite3_close(db);
+        outbox.acknowledge_batch({claims[7],claims[1],claims[0]});
+        const auto counts=outbox.accounting();
+        assert(counts.generated==9 && counts.acknowledged==3 && counts.dropped==1 && counts.retained==5);
+        outbox.acknowledge_batch({claims[2],claims[3],claims[4],claims[5],claims[6]});
+        assert(outbox.snapshot().size==0 && outbox.accounting().acknowledged==8);
     }
     std::filesystem::remove_all(directory);
     std::cout<<"durable outbox restart, transaction rollback, immutable losses, ownership and disk budget checks passed\n";

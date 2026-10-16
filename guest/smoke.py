@@ -28,6 +28,8 @@ class Console:
     def __init__(self, fd, child, logfile):
         self.fd, self.child, self.logfile = fd, child, logfile
         self.buffer = b''
+        self.resources = []
+        self.last_resource = 0.0
 
     def send(self, text):
         data = text.encode() + b'\n'
@@ -47,6 +49,14 @@ class Console:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise RuntimeError(f'serial assertion timed out: {pattern!r}')
+            if time.monotonic() - self.last_resource >= 10 and len(self.resources) < 128:
+                self.last_resource = time.monotonic()
+                proc = Path(f'/proc/{self.child.pid}/stat')
+                if proc.exists():
+                    fields = proc.read_text().rsplit(')', 1)[1].split()
+                    self.resources.append({'host_monotonic_ns':time.monotonic_ns(),
+                        'cpu_seconds':(int(fields[11]) + int(fields[12])) / os.sysconf('SC_CLK_TCK'),
+                        'rss_bytes':int(fields[21]) * os.sysconf('SC_PAGE_SIZE')})
             readable, _, _ = select.select([self.fd], [], [], min(remaining, 1))
             if readable:
                 chunk = os.read(self.fd, 65536)
@@ -75,8 +85,16 @@ def main():
     p.add_argument('--artifacts', required=True, type=Path)
     p.add_argument('--state', type=Path, help='dedicated persistent state disk; an existing disk is preserved')
     p.add_argument('--driver-tests', action='store_true', help='run installed module syscall/lifecycle checks and use device samples')
+    p.add_argument('--sensors', action='store_true', help='load the real QEMU ABI2 MMIO/IRQ driver')
+    p.add_argument('--sensor-contract', action='store_true', help='run ABI2 syscall/profile/reset checks and power off')
+    p.add_argument('--interval-ms', type=int, default=10)
+    p.add_argument('--seed', type=int, default=1)
+    p.add_argument('--storage-batch', type=int, default=1)
+    p.add_argument('--outbox-probe', type=Path, help='cross-compiled read-only snapshot helper for crash gate')
+    p.add_argument('--power-cut', action='store_true', help='kill QEMU while typed flight is live after a proven committed prefix')
+    p.add_argument('--inspect-outbox', action='store_true', help='recover/inspect persisted SQLite state then power off')
     args = p.parse_args()
-    if not 1 <= args.port <= 65535 or not 0 <= args.count <= 10000 or args.replay_count < 0 or args.timeout < 1:
+    if not 1 <= args.port <= 65535 or not 0 <= args.count <= 10000 or args.replay_count < 0 or args.timeout < 1 or not 1 <= args.storage_batch <= 16:
         p.error('port/count/timeout outside supported range')
     out = args.work.resolve() / 'output'
     state = args.state.resolve() if args.state else None
@@ -93,9 +111,12 @@ def main():
     # QEMU already supplies terminal CRLF; host line discipline must not add CR.
     tty.setraw(slave)
     child = None
+    console = None
     try:
         with (args.artifacts / 'serial.log').open('wb') as logfile:
-            child = subprocess.Popen(command(out, state), stdin=slave, stdout=slave, stderr=slave)
+            if 'qemu_executable_sha256' in manifest and digest(out / 'host/bin/qemu-system-aarch64') != manifest['qemu_executable_sha256']:
+                raise RuntimeError('installed QEMU executable identity mismatch')
+            child = subprocess.Popen(command(out, state, args.seed), stdin=slave, stdout=slave, stderr=slave)
             os.close(slave); slave = -1
             console = Console(master, child, logfile)
             console.wait(rb'orbit-guest login:', args.timeout)
@@ -125,6 +146,55 @@ def main():
             console.wait(rb'\r?\nORBIT_CREDENTIALS_READY\r?\n', 20)
             console.send("mkdir -p /var/lib/orbit; blkid /dev/vdb | grep -q 'LABEL=\"orbit-state\"' && mount /dev/vdb /var/lib/orbit && printf '\\nORBIT_STATE_MOUNTED\\n'")
             console.wait(rb'\r?\nORBIT_STATE_MOUNTED\r?\n', 20)
+            console.send("grep ' /var/lib/orbit ' /proc/mounts; printf '\\nORBIT_STATE_OPTIONS_END\\n'")
+            mount_info = console.wait(rb'\r?\nORBIT_STATE_OPTIONS_END\r?\n', 10).string
+            if b'barrier=0' in mount_info or b'nobarrier' in mount_info:
+                raise RuntimeError('persistent state filesystem has write barriers disabled')
+            probe_digest = None
+            if args.outbox_probe:
+                probe = args.outbox_probe.read_bytes()
+                probe_digest = __import__('hashlib').sha256(probe).hexdigest()
+                encoded = base64.b64encode(probe).decode()
+                console.send(': > /tmp/orbit-outbox-probe.b64')
+                for offset in range(0,len(encoded),512):
+                    console.send(f"printf '%s' '{encoded[offset:offset+512]}' >> /tmp/orbit-outbox-probe.b64")
+                    if offset % 4096 == 3584:
+                        marker = f'ORBIT_PROBE_CHUNK_{offset}'
+                        console.send(f"printf '\\n{marker}\\n'")
+                        console.wait(rb'\r?\n'+marker.encode()+rb'\r?\n',20)
+                console.send('base64 -d /tmp/orbit-outbox-probe.b64 > /tmp/orbit-outbox-probe; chmod 700 /tmp/orbit-outbox-probe; /usr/bin/openssl dgst -sha256 /tmp/orbit-outbox-probe')
+                console.wait(probe_digest.encode()+rb'\r?\n',20)
+            if args.inspect_outbox:
+                if not probe_digest:
+                    raise RuntimeError('outbox inspection requires --outbox-probe')
+                console.send("/tmp/orbit-outbox-probe /var/lib/orbit/outbox.db 0; orbit_probe_rc=$?; printf '\\nORBIT_PROBE_EXIT=%s\\n' \"$orbit_probe_rc\"")
+                snapshot = json.loads(console.wait(rb'ORBIT_OUTBOX=(\{[^\r\n]+\})',30).group(1))
+                probe_exit = console.wait(rb'\r?\nORBIT_PROBE_EXIT=(\d+)\r?\n',20)
+                if probe_exit.group(1) != b'0':
+                    raise RuntimeError('persisted outbox inspection/recovery failed')
+                console.send('poweroff'); child.wait(timeout=20)
+                if child.returncode:
+                    raise RuntimeError('recovery inspection shutdown failed')
+                (args.artifacts / 'result.json').write_text(json.dumps({'status':'passed',
+                    'gate':'SQLite persisted state recovered/inspected after VM power cut',
+                    'snapshot':snapshot,'probe_sha256':probe_digest},indent=2)+'\n')
+                return
+            if args.sensors or args.sensor_contract:
+                console.send("orbit_sensor_module=$(find /lib/modules -name orbit_sensors.ko | head -n 1); test -n \"$orbit_sensor_module\" && insmod \"$orbit_sensor_module\" && test -c /dev/orbit_sensors && printf '\\nORBIT_SENSORS_READY\\n'")
+                console.wait(rb'\r?\nORBIT_SENSORS_READY\r?\n', 20)
+            if args.sensor_contract:
+                console.send("/usr/bin/orbit-sensors-contract; orbit_sensor_rc=$?; dmesg; printf '\\nORBIT_SENSOR_EXIT=%s\\n' \"$orbit_sensor_rc\"")
+                contract = console.wait(rb'(?s)(.*?)\r?\nORBIT_SENSOR_EXIT=(\d+)\r?\n', 90)
+                if contract.group(2) != b'0' or re.search(rb'BUG:|WARNING:|KASAN:|possible circular locking|use-after-free', contract.group(1)):
+                    raise RuntimeError('ABI2 MMIO/IRQ syscall/profile/reset test failed; inspect serial.log')
+                console.send('poweroff')
+                child.wait(timeout=20)
+                if child.returncode:
+                    raise RuntimeError('sensor-contract guest shutdown failed')
+                (args.artifacts / 'result.json').write_text(json.dumps({'status':'passed',
+                    'gate':'ABI2 real MMIO/IRQ syscall/profile/counter/reset test',
+                    'image_sha256':manifest['artifacts_sha256']}, indent=2) + '\n')
+                return
             if args.driver_tests:
                 console.send("orbit_module=$(find /lib/modules -name orbit_test.ko | head -n 1); test -n \"$orbit_module\" && /usr/bin/orbit-driver-tests \"$orbit_module\" /usr/bin/orbit-syscall-contract 100 /var/lib/orbit/driver-artifacts; orbit_driver_rc=$?; for orbit_artifact in /var/lib/orbit/driver-artifacts/*; do printf '\\nORBIT_DRIVER_ARTIFACT=%s\\n' \"$orbit_artifact\"; cat \"$orbit_artifact\"; done; printf '\\nORBIT_DRIVER_EXIT=%s\\n' \"$orbit_driver_rc\"")
                 driver_exit = console.wait(rb'\r?\nORBIT_DRIVER_EXIT=(\d+)\r?\n', 300)
@@ -135,11 +205,43 @@ def main():
             cmd = ['/usr/bin/orbit-flight', args.host, str(1 if args.offline_seed else args.port),
                    '--ca', '/tmp/orbit-credentials/ca.pem', '--cert', '/tmp/orbit-credentials/cert.pem',
                    '--key', '/tmp/orbit-credentials/key.pem', '--server-name', args.server_name,
-                   '--count', str(args.count), '--interval-ms', '10',
-                   '--outbox', '/var/lib/orbit/outbox.db', '--capacity', str(max(1,args.count + args.replay_count)), '--drain-ms', '3000']
+                   '--count', str(args.count), '--interval-ms', str(args.interval_ms),
+                   '--outbox', '/var/lib/orbit/outbox.db', '--capacity', str(max(1024 if args.sensors else 1,args.count + args.replay_count)), '--drain-ms', '3000']
             if args.driver_tests:
                 cmd += ['--source', 'device', '--device', '/dev/orbit_telemetry']
-            console.send(shlex.join(cmd) + "; orbit_rc=$?; printf '\\nORBIT_EXIT=%s\\n' \"$orbit_rc\"")
+            if args.sensors:
+                cmd += ['--source', 'sensors', '--device', '/dev/orbit_sensors',
+                        '--send-window', '32', '--priority-scheduling', '1', '--io-timeout-ms', '2000',
+                        '--storage-batch', str(args.storage_batch)]
+            if args.power_cut:
+                if not args.sensors or not args.offline_seed or not probe_digest:
+                    raise RuntimeError('power-cut gate requires sensors/offline-seed/outbox-probe')
+                invocation = shlex.join(cmd) + ' > /var/lib/orbit/flight-summary.json 2>/var/lib/orbit/flight-stderr.log & orbit_flight_pid=$!; '
+                invocation += 'orbit_probe_attempt=0; until /tmp/orbit-outbox-probe /var/lib/orbit/outbox.db 110; do orbit_probe_attempt=$((orbit_probe_attempt+1)); test "$orbit_probe_attempt" -lt 30 && kill -0 "$orbit_flight_pid" 2>/dev/null || break; sleep 1; done; '
+                invocation += "kill -0 \"$orbit_flight_pid\" && printf '\\nORBIT_LIVE_FLIGHT_PID=%s\\n' \"$orbit_flight_pid\"; wait \"$orbit_flight_pid\""
+                console.send(invocation)
+                snapshot = json.loads(console.wait(rb'ORBIT_OUTBOX=(\{[^\r\n]+\})',90).group(1))
+                console.wait(rb'\r?\nORBIT_LIVE_FLIGHT_PID=(\d+)\r?\n',10)
+                if snapshot['retained'] < 110 or snapshot['acked'] or snapshot['dropped'] or snapshot['generated'] != snapshot['retained'] or len(snapshot['frames']) != snapshot['retained']:
+                    raise RuntimeError('pre-crash committed prefix is not bounded and loss-free')
+                child.kill(); child.wait(timeout=20)
+                if child.returncode != -9:
+                    raise RuntimeError('QEMU was not terminated by the intended SIGKILL')
+                (args.artifacts / 'result.json').write_text(json.dumps({'status':'passed',
+                    'gate':'QEMU SIGKILL while flight live after committed typed prefix; recovery verdict separate',
+                    'snapshot':snapshot,'probe_sha256':probe_digest,'qemu_returncode':child.returncode},indent=2)+'\n')
+                return
+            invocation = shlex.join(cmd)
+            if args.sensors:
+                invocation += " > /var/lib/orbit/flight-summary.json 2>/var/lib/orbit/flight-stderr.log & orbit_flight_pid=$!; "
+                invocation += "(while kill -0 \"$orbit_flight_pid\" 2>/dev/null; do cat /proc/$orbit_flight_pid/stat; grep '^VmRSS:' /proc/$orbit_flight_pid/status; sleep 10; done) > /var/lib/orbit/flight-resources.txt 2>/dev/null & orbit_sampler_pid=$!; "
+                invocation += "wait \"$orbit_flight_pid\"; orbit_rc=$?; kill \"$orbit_sampler_pid\" 2>/dev/null; wait \"$orbit_sampler_pid\" 2>/dev/null; printf '\\nORBIT_GUEST_RESOURCES_BEGIN\\n'; cat /var/lib/orbit/flight-resources.txt; printf '\\nORBIT_GUEST_RESOURCES_END\\n'; cat /var/lib/orbit/flight-stderr.log; cat /var/lib/orbit/flight-summary.json; printf '\\nORBIT_EXIT=%s\\n' \"$orbit_rc\""
+            else:
+                invocation += "; orbit_rc=$?; printf '\\nORBIT_EXIT=%s\\n' \"$orbit_rc\""
+            console.send(invocation)
+            if args.sensors:
+                resource_text = console.wait(rb'(?s)\r?\nORBIT_GUEST_RESOURCES_BEGIN\r?\n(.*?)\r?\nORBIT_GUEST_RESOURCES_END\r?\n', args.timeout).group(1)
+                (args.artifacts / 'guest-flight-resources.txt').write_bytes(resource_text)
             summary_match = console.wait(rb'(\{"state":[^\r\n]+\})', args.timeout)
             summary = json.loads(summary_match.group(1))
             exit_match = console.wait(rb'\r?\nORBIT_EXIT=(\d+)\r?\n', 20)
@@ -155,17 +257,27 @@ def main():
                         raise RuntimeError(f'{field}: expected {value}, got {summary.get(field)}')
             if args.driver_tests and summary.get('source') != 'device':
                 raise RuntimeError('driver gate did not use device-origin telemetry')
+            if args.sensors and summary.get('source') != 'sensors':
+                raise RuntimeError('sensor gate did not use ABI2 MMIO/IRQ telemetry')
             result = {'status': 'passed', 'summary': summary, 'versions': VERSIONS,
                       'image_sha256': manifest['artifacts_sha256'],
                       'host_alias': args.host, 'port': args.port, 'server_name': args.server_name,
-                      'gate': ('guest boot, driver syscall/lifecycle and device-source mTLS durable ACK count; ground database verification separate'
+                      'gate': ('guest boot and ABI2 multisensor MMIO/IRQ mTLS durable ACK count; ground database verification separate'
+                               if args.sensors else 'guest boot, driver syscall/lifecycle and device-source mTLS durable ACK count; ground database verification separate'
                                if args.driver_tests else 'guest boot and fake-source mTLS durable ACK count; ground database verification separate')}
             console.send('poweroff')
             child.wait(timeout=20)
             if child.returncode:
                 raise RuntimeError(f'QEMU shutdown failed: {child.returncode}')
             (args.artifacts / 'result.json').write_text(json.dumps(result, indent=2) + '\n')
+            (args.artifacts / 'qemu-resources.json').write_text(json.dumps(console.resources, indent=2) + '\n')
             print('Guest smoke passed:', args.artifacts / 'result.json')
+    except BaseException as error:
+        (args.artifacts / 'result.json').write_text(json.dumps({'status':'failed',
+            'error':str(error),'image_sha256':manifest['artifacts_sha256']},indent=2) + '\n')
+        if console:
+            (args.artifacts / 'qemu-resources.json').write_text(json.dumps(console.resources,indent=2) + '\n')
+        raise
     finally:
         if child and child.poll() is None:
             child.terminate()

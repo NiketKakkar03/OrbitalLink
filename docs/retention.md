@@ -14,8 +14,15 @@ floor((budget_bytes - 65536) / 3 / 4096) * 4096
 ```
 
 The remaining allowance covers rollback journal page entries and headers.
-Journal mode is DELETE, with synchronous FULL and macOS fullfsync enabled; WAL
-growth is not part of this design. Another 32 KiB within the database allowance
+Journal mode is DELETE, with synchronous EXTRA and macOS fullfsync enabled; WAL
+growth is not part of this design. Flight and ground verify their applied
+settings and refuse an unsupported journal mode. EXTRA also synchronizes the
+directory after deleting the rollback journal, closing the last-commit power-loss
+gap in DELETE/FULL documented by
+[SQLite](https://www.sqlite.org/pragma.html#pragma_synchronous). A real QEMU power
+cut exposed that gap before the correction: 115 committed records became 114
+after reboot. Keep the failed evidence distinct from subsequent recovery tests.
+Another 32 KiB within the database allowance
 reserves schema, counters, and bounded loss metadata. A conservative record bound
 is derived from the remaining database capacity at 256 bytes per sample.
 `--capacity N` can impose a smaller explicit record bound. The default 64 MiB
@@ -33,11 +40,19 @@ Restart retransmits unchanged old identities and payloads. New acquisition uses
 a new random boot identity, and production rejects manual boot overrides.
 
 At capacity, a transaction discards the oldest unclaimed samples, records their
-loss, and inserts the new sample. The claimed in-flight sample remains protected.
+loss, and inserts the new sample. All claimed in-flight samples remain protected.
 An artificially tiny capacity of one can therefore stop acquisition if that
 record is still awaiting an ACK; configure at least two records to retain a new
 sample while protecting an in-flight record. Capacity exhaustion that cannot be
 resolved, metadata exhaustion, or storage errors fail explicitly.
+
+The optional bounded send window supports 1–64 claimed records. Multisensor
+priority mode reserves urgent capacity and uses weighted service across urgent,
+operational and bulk records. Admission can instead reject an incoming record
+with durable loss accounting when protected or higher-priority records occupy
+the available slots. It never mutates a claimed payload. Optional ACK batching
+groups already-arrived matching receipts; it does not defer an ACK until a batch
+fills and does not batch acquisition commits.
 
 Loss reports coalesce adjacent unsent ranges within one boot. Once claimed,
 their identity and payload remain immutable across retries and restarts. There

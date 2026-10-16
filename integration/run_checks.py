@@ -23,6 +23,7 @@ SUITES = {
     "tsan": ["make", "test-tsan"],
     "security": ["make", "test-security"],
     "security-sanitizers": ["make", "test-security-sanitizers"],
+    "stress": ["make", "test-durable-stress"],
 }
 
 
@@ -145,12 +146,13 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--suite", action="append", choices=SUITES, help="Repeat to select checks; default native")
     parser.add_argument("--output", type=Path, help="New run directory; existing paths are refused")
-    parser.add_argument("--timeout", type=float, default=300, help="Deadline in seconds per suite")
+    parser.add_argument("--timeout", type=float, help="Override deadline per suite; defaults: native900s, stress1800s, others300s")
     parser.add_argument("--max-log-bytes", type=int, default=10 * 1024 * 1024)
     args = parser.parse_args(argv)
-    if not 0 < args.timeout < float("inf") or args.max_log_bytes < 1:
+    if (args.timeout is not None and not 0 < args.timeout < float("inf")) or args.max_log_bytes < 1:
         parser.error("timeout must be positive and finite; max-log-bytes must be positive")
     suites = list(dict.fromkeys(args.suite or ["native"]))
+    deadlines = {suite: args.timeout if args.timeout is not None else {"native": 900, "stress": 1800}.get(suite, 300) for suite in suites}
     now = dt.datetime.now(dt.timezone.utc)
     output = args.output or ROOT / "build" / "validation" / (
         now.strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
@@ -166,6 +168,7 @@ def main(argv: list[str] | None = None) -> int:
         "host": {"platform": platform.platform(), "machine": platform.machine(),
                  "python": sys.version, "python_executable": sys.executable},
         "parameters": {"suites": suites, "timeout_seconds": args.timeout,
+                       "suite_timeouts_seconds": deadlines,
                        "max_log_bytes": args.max_log_bytes},
         "status": "running", "checks": [],
     }
@@ -175,7 +178,7 @@ def main(argv: list[str] | None = None) -> int:
         for suite in suites:
             print(f"Running {suite}; log: {output / (suite + '.log')}", flush=True)
             result = run_command(
-                SUITES[suite], output / (suite + ".log"), timeout=args.timeout,
+                SUITES[suite], output / (suite + ".log"), timeout=deadlines[suite],
                 max_log_bytes=args.max_log_bytes,
             )
             manifest["checks"].append({"suite": suite, **result})

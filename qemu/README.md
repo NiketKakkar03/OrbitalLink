@@ -38,7 +38,9 @@ All registers are naturally aligned 32-bit little-endian accesses:
 | a0 | EVENT_PENDING | bounded unpublished event reports (maximum8) |
 | a4..b8 | EVENT_OBSERVATIONS /COALESCED /OVERFLOW | separate low/high64-bit observation counters |
 | c0 /c4 | SNAP_CLOCK_NS | atomic virtual-clock snapshot for guest clock calibration |
-| d0 | FAULT_CATEGORY | 0 clears;1..5 marks that category quality-fault and emits bounded sensor-fault event8; invalid writes ignored |
+| d0 | FAULT_CATEGORY | 0 clears; 1..5 selects the affected category; invalid writes ignored |
+| d4 | FAULT_MODE | 0 clears; 1 quality, 2 stuck, 3 signed bias, 4 deterministic bounded noise, 5 missing report, 6 invalid reading, 7 intermittent quality |
+| d8 | FAULT_PARAMETER | Signed bias for mode3 or non-negative noise amplitude for mode4; otherwise ignored |
 | e0..ec | DRIVER_DELIVERED /DRIVER_DROPPED | retained64-bit software accounting across driver bindings |
 | f0 /f4 | DRIVER_DELIVERED_ADD /DRIVER_DROPPED_ADD | commit consumed/discarded popped records; additions exceeding unaccounted popped count are rejected |
 | f8 /fc | POPPED | cumulative hardware-to-driver transfers |
@@ -80,6 +82,13 @@ ABI2 read/ioctl behavior, enable/disable/rate/reset/clear-fault and truthful sta
 queries, the complete scenario mix and reset generation. The matching
 device-tree schema is `driver/bindings/orbital,multisensor-v2.yaml`.
 Presence of test code is not a pass: retain the actual test result artifacts.
+
+Fault injection is deterministic for a fixed seed and configuration. Activating
+or clearing a fault emits a bounded event. Missing-report mode increments the
+hardware generated and dropped counters without placing a record in the FIFO;
+the flight service converts increases in the driver's dropped counter into a
+durable aggregate loss report. Stuck mode freezes the last value for the selected
+category, and the remaining modes change only that category's subsequent records.
 
 Live VM migration/snapshots of the hub are not implemented. The supported
 recovery mechanism is the separately persisted flight outbox; QEMU process

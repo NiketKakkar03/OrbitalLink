@@ -186,17 +186,24 @@ static long sensor_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	struct orbit_sensor_clock clock = {0};
 	struct orbit_sensor_events events = {0};
 	struct orbit_sensor_state state = {.abi_version = 2};
+	struct orbit_sensor_fault fault;
 	unsigned long flags;
 	u64 hardware_dropped;
 	int ret;
 	if (cmd != ORBIT_SENSOR_GET_STATS && cmd != ORBIT_SENSOR_SET_RATE && cmd != ORBIT_SENSOR_RESET &&
 	    cmd != ORBIT_SENSOR_GET_CLOCK && cmd != ORBIT_SENSOR_CLOCK_CURRENT && cmd != ORBIT_SENSOR_GET_EVENTS &&
 	    cmd != ORBIT_SENSOR_ENABLE && cmd != ORBIT_SENSOR_DISABLE && cmd != ORBIT_SENSOR_CLEAR_FAULT &&
-	    cmd != ORBIT_SENSOR_GET_STATE)
+	    cmd != ORBIT_SENSOR_GET_STATE && cmd != ORBIT_SENSOR_SET_FAULT)
 		return -ENOTTY;
 	if (cmd == ORBIT_SENSOR_SET_RATE) {
 		if (copy_from_user(&rate, (void __user *)arg, sizeof(rate))) return -EFAULT;
 		if (rate.abi_version != 2 || rate.period_ms < 1 || rate.period_ms > 60000 || rate.reserved[0] || rate.reserved[1])
+			return -EINVAL;
+	}
+	if (cmd == ORBIT_SENSOR_SET_FAULT) {
+		if (copy_from_user(&fault, (void __user *)arg, sizeof(fault))) return -EFAULT;
+		if (fault.abi_version != 2 || fault.category < 1 || fault.category > 5 ||
+		    fault.mode < 1 || fault.mode > 7 || fault.parameter < -1000000 || fault.parameter > 1000000)
 			return -EINVAL;
 	}
 	ret = mutex_lock_interruptible(&d->io);
@@ -240,6 +247,8 @@ static long sensor_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		state.generation = readl(d->base + 0x28);
 		state.reset_count = readl(d->base + 0x2c);
 		state.fault_category = readl(d->base + 0xd0);
+		state.fault_mode = readl(d->base + 0xd4);
+		state.fault_parameter = (s32)readl(d->base + 0xd8);
 		state.command_effects = d->command_effects;
 	} else if (cmd == ORBIT_SENSOR_ENABLE) {
 		writel(readl(d->base + 0x08) | 3, d->base + 0x08);
@@ -249,6 +258,13 @@ static long sensor_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		d->command_effects++;
 	} else if (cmd == ORBIT_SENSOR_CLEAR_FAULT) {
 		writel(0, d->base + 0xd0);
+		writel(0, d->base + 0xd4);
+		writel(0, d->base + 0xd8);
+		d->command_effects++;
+	} else if (cmd == ORBIT_SENSOR_SET_FAULT) {
+		writel((u32)fault.parameter, d->base + 0xd8);
+		writel(fault.mode, d->base + 0xd4);
+		writel(fault.category, d->base + 0xd0);
 		d->command_effects++;
 	} else {
 		d->dropped += d->count;

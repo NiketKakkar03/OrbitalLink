@@ -36,6 +36,7 @@ public:
     virtual orbit_stats stats()=0;
     virtual bool set_rate(const orbit_rate& rate)=0;
     virtual bool control(unsigned long command) {(void)command;return false;}
+    virtual bool set_fault(const orbit_sensor_fault& fault) {(void)fault;return false;}
     virtual std::optional<orbit_sensor_state> sensor_state() {return {};}
     virtual orbit_sensor_events events_info() {return {};}
     virtual orbit_sensor_clock clock_info(bool current=false) {(void)current;return {};}
@@ -97,6 +98,9 @@ public:
         orbit_sensor_state state{};
         if(::ioctl(fd_,ORBIT_SENSOR_GET_STATE,&state)!=0)return {};
         return state;
+    }
+    bool set_fault(const orbit_sensor_fault& fault) override {
+        return sensors_ && ::ioctl(fd_,ORBIT_SENSOR_SET_FAULT,&fault)==0;
     }
 };
 #endif
@@ -183,10 +187,16 @@ public:
     bool disable() {return io_->control(ORBIT_SENSOR_DISABLE);}
     bool reset() {return io_->control(ORBIT_SENSOR_RESET);}
     bool clear_fault() {return io_->control(ORBIT_SENSOR_CLEAR_FAULT);}
+    bool set_fault(std::uint32_t category,std::uint32_t mode,std::int32_t parameter=0) {
+        if(category<1 || category>5 || mode<1 || mode>7 || parameter < -1000000 || parameter > 1000000)return false;
+        return io_->set_fault({2,category,mode,parameter});
+    }
     orbit_sensor_state state() {
         const auto value=io_->sensor_state();
         if(!value || value->abi_version!=2 || value->enabled>1 || value->period_ms<1 ||
-           value->period_ms>60000 || value->fault_category>5 || value->reserved[0] || value->reserved[1])
+           value->period_ms>60000 || value->fault_category>5 || value->fault_mode>7 ||
+           value->fault_parameter < -1000000 || value->fault_parameter > 1000000 ||
+           (!value->fault_category && (value->fault_mode || value->fault_parameter)))
             throw std::runtime_error("invalid multisensor device state");
         return *value;
     }

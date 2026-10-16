@@ -286,8 +286,8 @@ a sustained-throughput benchmark. See [driver details](driver.md).
 | M5 guest | Passed two real boots: 7 retained samples + 100 new = 107 ground rows across two boot IDs |
 | M6 driver test source | Passed syscall/lifecycle gate and 100 driver-origin TLS samples |
 | M7 custom peripheral | Complete: ABI2 hub/IRQ driver, binding schema, controls/state UAPI, QTest, driver rebind contract, EXTRA-durable baseline and abrupt-power-cut recovery passed |
-| M8 fault/measurement | Native and embedded 600-second baselines passed; overload/window/recovery tests expanded; embedded 100 Hz limit measured; full fault matrix pending |
-| M9 release | Clean source tests and clean-checkout smoke passed; release, patch/license and operational work pending |
+| M8 fault/measurement | Complete: deterministic device fault matrix, durable kernel-loss reporting, native and embedded baselines, overload/recovery, abrupt power cuts and measured 100 Hz limit |
+| M9 release | Release preparation implemented: licensing, clean-build procedure, archive/certificate/upgrade runbook and artifact checklist; publication remains an explicit operator action |
 
 The native suite includes protocol/storage, recovery, typed sensors, bounded
 windows and overload tests, C++ checks and driver host ABI/FIFO checks.
@@ -321,7 +321,7 @@ not a published release archive. Earlier failed attempts were preserved in the
 Linux build volume. A passing gate means those scenarios passed on that build;
 it does not establish correctness for every fault or deployment.
 
-## 11. Remaining design to implement
+## 11. Completed scope and later extensions
 
 The custom hub now implements coherent latched samples, little-endian MMIO,
 a level-triggered IRQ, masking, overrun/reset accounting, a deterministic
@@ -334,13 +334,15 @@ The driver control/state UAPI now supports real enable/disable/reset/clear-fault
 and truthful query-state. The existing authorization/replay/deadline rules feed
 these ioctl/register effects through the acquisition-owned command dispatcher.
 
-M8 still needs abrupt guest-power-loss tests, physical-disk/storage fault
-scenarios, the full embedded network/device fault matrix, kernel-loss reporting,
-rate/backpressure calibration, throughput/latency/resource measurements and
-repeated stress evidence. M9 needs clean-checkout reproduction, patch/license
-review, release artifacts, deployment/credential operations, ground archive policy
-and a documented demonstration. Yocto is a later extension after the first
-Buildroot-based release, not a completed component.
+M8 now covers the deterministic embedded fault modes, persistent reporting of
+driver/hardware drops, network replay faults, storage-full transaction rollback,
+hot-journal recovery, three abrupt guest power cuts, bounded stress and measured
+throughput/latency/resource behavior. The supported embedded baseline remains
+10 Hz. The 100 Hz experiment retained its backlog but exceeded real-time capacity.
+Physical media failure, calibrated sensor physics and live VM migration require
+hardware or platform-specific campaigns outside this repository. M9's operating
+procedure is in [release operations](release.md). Yocto remains a later extension
+after the first Buildroot-based release.
 
 ## 12. How to explore and run it
 

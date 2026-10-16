@@ -62,6 +62,16 @@ def main():
             def sample():
                 return [read(0x40 + i * 4) for i in range(16)]
 
+            def next_category(category, limit=40):
+                for _ in range(limit):
+                    tick(1_000_000)
+                    while read(0x20):
+                        words = sample()
+                        write(0x1c, 1)
+                        if words[1] == category:
+                            return words
+                raise AssertionError(f'category {category} did not arrive')
+
             assert read(0) == 0x4f534e32 and read(4) == 2
             assert read(0xffc) == 0
             command(f'readb {BASE:#x}')  # Invalid widths must not mutate state.
@@ -132,6 +142,7 @@ def main():
             assert read(0x20) == count
             while read(0x20):
                 write(0x1c, 1)
+            write(0xd4, 1)
             write(0xd0, 3)
             fault = sample()
             assert fault[1] == 6 and fault[8] == 8 and fault[10] == 3
@@ -148,12 +159,48 @@ def main():
             write(0xd0, 0)
             write(0xd0, 6)
             assert read(0xd0) == 0
+
+            # Deterministic category-specific M8 fault matrix.
+            normal_science = next_category(5)
+            write(0xd4, 2); write(0xd0, 5)
+            stuck_a = next_category(5); stuck_b = next_category(5)
+            assert stuck_a[8:16] == normal_science[8:16] == stuck_b[8:16]
+            assert stuck_a[6] & 1 and stuck_b[6] & 1
+
+            write(0xd0, 0); write(0xd8, 500); write(0xd4, 3); write(0xd0, 2)
+            biased = next_category(2)
+            assert biased[8] - 500 in (15000, 25000) and biased[6] & 1
+
+            write(0xd0, 0); write(0xd8, 9); write(0xd4, 4); write(0xd0, 1)
+            noisy = next_category(1)
+            assert 3291 <= noisy[8] <= 4109 and noisy[6] & 1
+
+            write(0xd0, 0); write(0xd8, 0); write(0xd4, 6); write(0xd0, 1)
+            invalid = next_category(1)
+            assert invalid[8] == 0x80000000 and invalid[6] & 2
+
+            write(0xd0, 0); write(0xd4, 7); write(0xd0, 2)
+            intermittent = [next_category(2)[6] & 1, next_category(2)[6] & 1]
+            assert intermittent == [0, 1]
+
+            while read(0x20): write(0x1c, 1)
+            write(0x80, 1); dropped_before = read(0x98)
+            write(0xd0, 0); write(0xd4, 5); write(0xd0, 5)
+            seen_science = False
+            for _ in range(10):
+                tick(1_000_000)
+                while read(0x20):
+                    words = sample(); seen_science |= words[1] == 5; write(0x1c, 1)
+            write(0x80, 1)
+            assert not seen_science and read(0x98) == dropped_before + 1
+            write(0xd0, 0); write(0xd4, 0); write(0xd8, 0)
             (args.output / 'result.json').write_text(json.dumps({
                 'status':'passed', 'routine_ticks':600, 'reports':606,
                 'categories':dict(categories), 'event_codes':events,
                 'checks':['MMIO identity','virtual timer','latched coherent head',
                     'bounded FIFO/overrun','atomic counter snapshot','reset generation/event',
-                    'rate validation','IRQ level status','stop control','bounded sensor fault event/quality']}, indent=2) + '\n')
+                    'rate validation','IRQ level status','stop control','bounded sensor fault event/quality',
+                    'stuck/bias/noise/missing/invalid/intermittent fault modes']}, indent=2) + '\n')
         finally:
             client.close()
             child.terminate()

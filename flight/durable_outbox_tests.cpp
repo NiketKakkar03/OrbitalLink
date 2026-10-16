@@ -140,6 +140,15 @@ int main(int argc,char** argv) {
         DurableOutbox outbox(path,262144,2);auto next=outbox.claim();assert(next && next->flight_boot_id==123);outbox.acknowledge(*next);
     }
     // Actual physical DB budget bounds storage, even with an enormous count cap.
+    {
+        DurableOutbox outbox((directory/"aggregate-loss.db").string(),262144,8);
+        outbox.record_aggregate_loss(7);outbox.record_aggregate_loss(5);
+        const auto reports=outbox.losses();
+        assert(reports.size()==1 && !reports[0].detail_complete && !reports[0].boot_id &&
+               !reports[0].first && !reports[0].last && reports[0].count==12);
+        const auto claimed=outbox.claim_loss();assert(claimed && claimed->count==12);
+        outbox.acknowledge_loss(claimed->id);assert(outbox.losses().empty());
+    }
     const auto bounded=(directory/"bounded.db").string();
     {
         DurableOutbox outbox(bounded,262144,1000000);

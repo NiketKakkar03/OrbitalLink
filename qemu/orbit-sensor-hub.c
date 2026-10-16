@@ -27,7 +27,11 @@ struct OrbitHub {
     HubSample fifo[HUB_CAPACITY];
     uint32_t head, count, control, period_ms, seed, generation, sequence;
     uint32_t reset_count;
-    uint32_t fault_category;
+    uint32_t fault_category, fault_mode;
+    int32_t fault_parameter;
+    uint64_t fault_matches;
+    int32_t last_values[5][8];
+    bool have_last[5];
     uint64_t tick, generated, dropped, popped;
     uint64_t snapshot_generated, snapshot_dropped;
     uint64_t snapshot_ns;
@@ -69,13 +73,11 @@ static void hub_tick(void *opaque)
 {
     OrbitHub *s = opaque;
     struct orbit_scenario_record routine, event;
+    bool missing = false;
     if (!(s->control & 1)) {
         return;
     }
     bool has_event = orbit_scenario_tick(s->tick++, s->seed, &routine, &event);
-    if (routine.category == s->fault_category) {
-        routine.quality |= 1;
-    }
     if (routine.category == 4) {
         routine.values[0] = (qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 1000000000LL) & INT32_MAX;
         routine.values[1] = s->reset_count;
@@ -84,11 +86,55 @@ static void hub_tick(void *opaque)
         routine.values[4] = s->driver_delivered & INT32_MAX;
         routine.values[5] = (s->dropped + s->driver_dropped) & INT32_MAX;
     }
+    if (routine.category >= 1 && routine.category <= 5) {
+        unsigned index = routine.category - 1;
+        if (routine.category == s->fault_category) {
+            int64_t changed;
+            uint64_t occurrence = s->fault_matches++;
+            switch (s->fault_mode) {
+            case 1: routine.quality |= 1; break;
+            case 2:
+                if (s->have_last[index]) {
+                    memcpy(routine.values, s->last_values[index], sizeof(routine.values));
+                }
+                routine.quality |= 1;
+                break;
+            case 3:
+                changed = (int64_t)routine.values[0] + s->fault_parameter;
+                routine.values[0] = CLAMP(changed, INT32_MIN, INT32_MAX);
+                routine.quality |= 1;
+                break;
+            case 4: {
+                int64_t raw = s->fault_parameter;
+                uint32_t amplitude = MIN((uint64_t)(raw < 0 ? -raw : raw), UINT64_C(1000000));
+                uint32_t mixed = (uint32_t)(s->tick * UINT64_C(1103515245)) + s->seed + routine.category * 12345;
+                int32_t noise = amplitude ? (int32_t)(mixed % (amplitude * 2U + 1U)) - (int32_t)amplitude : 0;
+                changed = (int64_t)routine.values[0] + noise;
+                routine.values[0] = CLAMP(changed, INT32_MIN, INT32_MAX);
+                routine.quality |= 1;
+                break;
+            }
+            case 5:
+                s->sequence++; s->generated++; s->dropped++; s->overrun = true;
+                missing = true; break;
+            case 6:
+                routine.values[0] = INT32_MIN; routine.quality |= 2; break;
+            case 7:
+                if (occurrence & 1) routine.quality |= 1;
+                break;
+            default: break;
+            }
+        }
+        if (!(routine.category == s->fault_category && s->fault_mode == 2)) {
+            memcpy(s->last_values[index], routine.values, sizeof(routine.values));
+            s->have_last[index] = true;
+        }
+    }
     if (has_event) {
         orbit_event_push(&s->events, &event);
     }
     hub_flush_events(s);
-    hub_enqueue(s, &routine);
+    if (!missing) hub_enqueue(s, &routine);
     hub_irq(s);
     timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
               (uint64_t)s->period_ms * SCALE_MS);
@@ -143,6 +189,8 @@ static uint64_t hub_read(void *opaque, hwaddr offset, unsigned size)
     case 0xc0: return s->snapshot_ns;
     case 0xc4: return s->snapshot_ns >> 32;
     case 0xd0: return s->fault_category;
+    case 0xd4: return s->fault_mode;
+    case 0xd8: return (uint32_t)s->fault_parameter;
     case 0xe0: return s->driver_delivered;
     case 0xe4: return s->driver_delivered >> 32;
     case 0xe8: return s->driver_dropped;
@@ -203,6 +251,10 @@ static void hub_write(void *opaque, hwaddr offset, uint64_t value,
             s->tick = 0;
             s->overrun = false;
             s->fault_category = 0;
+            s->fault_mode = 0;
+            s->fault_parameter = 0;
+            s->fault_matches = 0;
+            memset(s->have_last, 0, sizeof(s->have_last));
             for (unsigned i = 0; i < s->events.count; ++i) {
                 s->events.overflow += s->events.pending[i].values[3];
             }
@@ -239,6 +291,7 @@ static void hub_write(void *opaque, hwaddr offset, uint64_t value,
     case 0xd0:
         if (value <= 5 && value != s->fault_category) {
             s->fault_category = value;
+            s->fault_matches = 0;
             if (value) {
                 struct orbit_scenario_record event = {
                     .category = 6, .values = {8, 1, value, 1}
@@ -247,6 +300,12 @@ static void hub_write(void *opaque, hwaddr offset, uint64_t value,
                 hub_flush_events(s);
             }
         }
+        break;
+    case 0xd4:
+        if (value <= 7) { s->fault_mode = value; s->fault_matches = 0; }
+        break;
+    case 0xd8:
+        s->fault_parameter = (int32_t)value;
         break;
     case 0xf0:
         if (value <= s->popped - s->driver_delivered - s->driver_dropped) {

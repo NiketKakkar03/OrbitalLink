@@ -332,6 +332,8 @@ void acquisition_loop(const Config& config, Shared& shared) {
     shared.commands.configure(static_cast<std::uint32_t>(config.interval_ms), config.fake_fault);
     if(shared.sensors) {
         if(!shared.sensors->set_rate(static_cast<std::uint32_t>(config.interval_ms)))throw std::runtime_error("sensor SET_RATE failed");
+        shared.driver_stats=shared.sensors->stats();
+        auto reported_driver_drops=shared.driver_stats.dropped;
         std::uint64_t acquired=0;
         while(acquired<config.count && !shared.stop_requested.load()) {
             shared.commands.execute(monotonic_ns());
@@ -341,6 +343,10 @@ void acquisition_loop(const Config& config, Shared& shared) {
                 if(record.category==6)++shared.scenario_events;
             }
             shared.driver_stats=shared.sensors->stats();
+            if(shared.driver_stats.dropped>reported_driver_drops) {
+                if(shared.durable)shared.durable->record_aggregate_loss(shared.driver_stats.dropped-reported_driver_drops);
+                reported_driver_drops=shared.driver_stats.dropped;
+            }
         }
         shared.acquisition_done.store(true);
         while(!shared.network_done.load() && !shared.stop_requested.load()) {shared.commands.execute(monotonic_ns());std::this_thread::sleep_for(Milliseconds(1));}

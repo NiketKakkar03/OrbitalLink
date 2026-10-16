@@ -34,6 +34,7 @@ public:
     void acknowledge_batch(const std::vector<TelemetrySample>& samples);
     std::optional<DurableLoss> claim_loss();
     void acknowledge_loss(std::uint64_t id);
+    void record_aggregate_loss(std::uint64_t count);
     std::vector<DurableLoss> losses() const;
     RetentionQueueSnapshot snapshot() const;
     DurableAccounting accounting() const;

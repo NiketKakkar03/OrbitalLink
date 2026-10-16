@@ -131,6 +131,27 @@ std::vector<DurableLoss> DurableOutbox::losses_locked() const {
     return result;
 }
 std::vector<DurableLoss> DurableOutbox::losses() const {std::lock_guard lock(mutex_);return losses_locked();}
+void DurableOutbox::record_aggregate_loss(std::uint64_t count) {
+    if(!count)return;
+    std::lock_guard lock(mutex_);
+    exec("BEGIN IMMEDIATE");
+    try {
+        auto row=prepare(db_,"SELECT id FROM loss WHERE complete=0 AND frozen=0 ORDER BY id LIMIT 1");
+        if(sqlite3_step(row.get())==SQLITE_ROW) {
+            const auto id=static_cast<std::uint64_t>(sqlite3_column_int64(row.get(),0));
+            row.reset();exec("UPDATE loss SET count=count+"+identity(count)+" WHERE id="+identity(id));
+        } else {
+            row.reset();
+            if(scalar("SELECT count(*) FROM loss")>=65)throw std::runtime_error("outbox loss metadata exhausted; stop acquisition");
+            const auto id=(static_cast<std::uint64_t>(std::random_device{}())<<31 ^ std::random_device{}()) & 0x7fffffffffffffffULL;
+            exec("INSERT INTO loss(id,boot,first,last,count,complete) VALUES("+identity(id)+",'0','0','0',"+identity(count)+",0)");
+        }
+        exec("COMMIT");
+    } catch(...) {
+        if(!sqlite3_get_autocommit(db_))sqlite3_exec(db_,"ROLLBACK",nullptr,nullptr,nullptr);
+        throw;
+    }
+}
 void DurableOutbox::record_loss(const TelemetrySample& value) {
     auto reports=losses_locked();
     for(auto it=reports.rbegin();it!=reports.rend();++it) {

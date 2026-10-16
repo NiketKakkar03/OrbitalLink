@@ -164,15 +164,17 @@ storage or link failure; all exhausted capacity must remain explicit.
 |Priority/capacity|Weighted fairness, reserved urgent capacity, all-claimed protection, overload admission, mode-reopen atomic rollback|
 |Source contracts|ABI2 whole 64-byte reads, invalid category 0, malformed/partial records, counter equations, supported real rate effects|
 |Scenario interactions|Repeatable category mix, eclipse/power/thermal, orientation/payload pause, bounded repeated-event reports|
-|Hardware/MMIO|Actual patched QEMU qtests for coherent latch, GIClevel IRQ mask/unmask, overflow, snapshot, rate/reset and complete scenario mix|
+|Hardware/MMIO|Actual patched QEMU qtests for coherent latch, GIC level IRQ mask/unmask, overflow, snapshot, rate/reset, complete scenario mix and all seven category-specific fault modes|
 |Guest/endurance|Actual ABI2 module and custom hub require their own result artifacts;600 second gate distinct from native baseline|
 |Security|Existing mutualTLS and command authorization/replay/deadline suites; no plaintext production fallback|
 
-Still distinct from these checks: a complete physical-full-disk fault campaign,
-sensor-specific stuck/bias/noise fault controls, long randomized stress, higher
-rate embedded endurance, production key operations and custom-device live VM
-migration. Guest process/power-loss tests must preserve committed typed backlog
-and stable identities; a clean reboot alone is not an abrupt-power-loss test.
+The deterministic fault controls cover quality, stuck, signed bias, bounded
+noise, missing reports, invalid readings and intermittent quality. Driver/hardware
+drop deltas become durable reason-2 aggregate loss reports. Storage tests cover
+configured page limits, rollback on simulated FULL, hot-journal recovery and
+abrupt VM power cuts. Physical media failure, higher-rate embedded endurance,
+production key ceremonies and custom-device live migration remain deployment or
+future-platform work rather than claims made by this release.
 
 ## Release preparation gates
 

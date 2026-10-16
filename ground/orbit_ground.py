@@ -196,7 +196,9 @@ def serve(
             listener.settimeout(0.2)
             actual_port = listener.getsockname()[1]
             if ready_file is not None:
-                ready_file.write_text(f"{actual_port}\n")
+                temporary_ready = ready_file.with_name(f".{ready_file.name}.tmp")
+                temporary_ready.write_text(f"{actual_port}\n")
+                temporary_ready.replace(ready_file)
 
             while not own_stop_event.is_set():
                 if max_receipts is not None and receiver.receipts >= max_receipts:

@@ -7,13 +7,14 @@ struct SensorIo:orbit::DeviceIo {
     orbit_stats status{2,320,3,2,1,1,1,0,{1,0}};
     orbit_sensor_sample record{2,2,1,17,123456,0,1,{-5000,35000,1,0,0,0,0,0}};
     std::ptrdiff_t result{64};std::size_t requested{};bool rate_ok{true};unsigned long last_control{};
-    orbit_sensor_state current{2,1,100,1,3,0,{0,0},4};
+    orbit_sensor_state current{2,1,100,1,3,1,0,0,4};
     bool ready(int ms)override {assert(ms==25);return true;}
     std::ptrdiff_t read_records(void* output,std::size_t bytes)override {requested=bytes;if(result==64)std::memcpy(output,&record,64);return result;}
     orbit_stats stats()override{return status;}
     orbit_sensor_events events_info()override{return {100,99,0,1,0};}
     bool set_rate(const orbit_rate& r)override{assert(r.abi_version==2 && !r.reserved[0] && !r.reserved[1]);return rate_ok;}
     bool control(unsigned long command)override{last_control=command;return true;}
+    bool set_fault(const orbit_sensor_fault& fault)override{current.fault_category=fault.category;current.fault_mode=fault.mode;current.fault_parameter=fault.parameter;return true;}
     std::optional<orbit_sensor_state> sensor_state()override{return current;}
 };
 static bool rejects(const std::function<void()>& f){try{f();}catch(const std::exception&){return true;}return false;}
@@ -30,7 +31,9 @@ int main(){
     assert(source.disable() && io->last_control==ORBIT_SENSOR_DISABLE);
     assert(source.reset() && io->last_control==ORBIT_SENSOR_RESET);
     assert(source.clear_fault() && io->last_control==ORBIT_SENSOR_CLEAR_FAULT);
-    assert(source.state().fault_category==3 && source.state().command_effects==4);
+    assert(source.set_fault(2,3,-25) && io->current.fault_category==2 && io->current.fault_parameter==-25);
+    assert(!source.set_fault(0,1) && !source.set_fault(1,8));
+    assert(source.state().fault_category==2 && source.state().fault_mode==3 && source.state().command_effects==4);
     io->current.enabled=2;assert(rejects([&]{source.state();}));io->current.enabled=1;
     io->rate_ok=false;assert(!source.set_rate(10));
     for(auto bytes:{0,1,63,65,1025}){io->result=bytes;assert(rejects([&]{source.read(1);}));}

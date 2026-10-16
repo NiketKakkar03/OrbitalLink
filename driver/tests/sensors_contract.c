@@ -25,6 +25,7 @@ int main(void)
 	struct orbit_sensor_clock clock;
 	struct orbit_sensor_events events;
 	struct orbit_sensor_state state;
+	struct orbit_sensor_fault fault = {.abi_version = 2, .category = 2, .mode = 3, .parameter = -500};
 	struct orbit_rate rate = {.abi_version = 2, .period_ms = 10};
 	unsigned counts[7] = {0}, total = 0;
 	uint64_t last_ns = 0;
@@ -40,13 +41,11 @@ int main(void)
 	assert(ioctl(fd, ORBIT_SENSOR_SET_RATE, &rate) == 0);
 	assert(ioctl(fd, ORBIT_SENSOR_GET_STATE, &state) == 0);
 	assert(state.abi_version == 2 && state.enabled == 1 && state.period_ms == 10 && state.generation == 1);
-	assert(state.fault_category == 0 && state.command_effects == 1 && !state.reserved[0] && !state.reserved[1]);
+	assert(state.fault_category == 0 && state.fault_mode == 0 && state.fault_parameter == 0 && state.command_effects == 1);
 	assert(ioctl(fd, ORBIT_SENSOR_DISABLE) == 0);
 	assert(ioctl(fd, ORBIT_SENSOR_GET_STATE, &state) == 0 && state.enabled == 0 && state.command_effects == 2);
 	assert(ioctl(fd, ORBIT_SENSOR_ENABLE) == 0);
 	assert(ioctl(fd, ORBIT_SENSOR_GET_STATE, &state) == 0 && state.enabled == 1 && state.command_effects == 3);
-	assert(ioctl(fd, ORBIT_SENSOR_CLEAR_FAULT) == 0);
-	assert(ioctl(fd, ORBIT_SENSOR_GET_STATE, &state) == 0 && state.fault_category == 0 && state.command_effects == 4);
 	assert(ioctl(fd, ORBIT_SENSOR_GET_CLOCK, &clock) == 0);
 	assert(clock.uncertainty_ns < 1000000000ULL);
 	while (total < 606) {
@@ -68,6 +67,13 @@ int main(void)
 	}
 	rate.period_ms = 60000;
 	assert(ioctl(fd, ORBIT_SENSOR_SET_RATE, &rate) == 0);
+	assert(ioctl(fd, ORBIT_SENSOR_SET_FAULT, &fault) == 0);
+	assert(ioctl(fd, ORBIT_SENSOR_GET_STATE, &state) == 0 && state.fault_category == 2 &&
+	       state.fault_mode == 3 && state.fault_parameter == -500 && state.command_effects == 5);
+	fault.mode = 8; assert(ioctl(fd, ORBIT_SENSOR_SET_FAULT, &fault) == -1 && errno == EINVAL); fault.mode = 3;
+	assert(ioctl(fd, ORBIT_SENSOR_CLEAR_FAULT) == 0);
+	assert(ioctl(fd, ORBIT_SENSOR_GET_STATE, &state) == 0 && state.fault_category == 0 &&
+	       state.fault_mode == 0 && state.fault_parameter == 0 && state.command_effects == 6);
 	assert(total == 606);
 	assert(counts[1] == 120 && counts[2] == 60 && counts[3] == 300);
 	assert(counts[4] == 60 && counts[5] == 60 && counts[6] == 6);
@@ -79,7 +85,7 @@ int main(void)
 	assert(ioctl(fd, ORBIT_SENSOR_GET_STATE, bad) == -1 && errno == EFAULT);
 	assert(munmap(bad, 4096) == 0);
 	assert(ioctl(fd, ORBIT_SENSOR_RESET) == 0);
-	assert(ioctl(fd, ORBIT_SENSOR_GET_STATE, &state) == 0 && state.generation == 2 && state.reset_count == 1 && state.command_effects == 6);
+	assert(ioctl(fd, ORBIT_SENSOR_GET_STATE, &state) == 0 && state.generation == 2 && state.reset_count == 1 && state.command_effects == 7);
 	struct pollfd p = {.fd = fd, .events = POLLIN};
 	assert(poll(&p, 1, 2000) == 1);
 	bad = mmap(NULL, 4096, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -93,7 +99,7 @@ int main(void)
 	assert(after.reserved[0] == 2 && after.reserved[1] == 1);
 	assert(after.delivered == before.delivered + 1);
 	assert(ioctl(fd, ORBIT_SENSOR_GET_EVENTS, &events) == 0);
-	assert(events.observations == 7 && !events.coalesced && !events.overflow && !events.pending && !events.reserved);
+	assert(events.observations == 8 && !events.coalesced && !events.overflow && !events.pending && !events.reserved);
 	/* Rebinding after consumption and pending software records must preserve
 	 * all delivered/dropped totals, rather than inventing a fresh epoch. */
 	rate.period_ms = 1;

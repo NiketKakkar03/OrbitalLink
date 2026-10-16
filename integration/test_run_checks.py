@@ -140,3 +140,21 @@ def test_interrupted_manifest_is_finalized(tmp_path: Path, monkeypatch):
     manifest = json.loads((output / "manifest.json").read_text())
     assert manifest["status"] == "interrupted"
     assert "finished_at_utc" in manifest
+
+
+def test_suite_deadlines_and_explicit_override_are_recorded(tmp_path, monkeypatch):
+    monkeypatch.setattr(run_checks, "SUITES", {name: ["unused"] for name in ("native", "stress", "security")})
+    seen=[]
+    def complete(command, log_path, **kwargs):
+        seen.append(kwargs["timeout"])
+        log_path.write_text("passed\n")
+        return {"status": "passed", "log": log_path.name}
+    monkeypatch.setattr(run_checks, "run_command", complete)
+    output=tmp_path/"defaults"
+    assert run_checks.main(["--suite", "native", "--suite", "stress", "--suite", "security", "--output", str(output)])==0
+    assert seen==[900,1800,300]
+    manifest=json.loads((output/"manifest.json").read_text())
+    assert manifest["parameters"]["suite_timeouts_seconds"]=={"native":900,"stress":1800,"security":300}
+    seen.clear()
+    assert run_checks.main(["--suite", "native", "--suite", "stress", "--timeout", "12", "--output", str(tmp_path/"override")])==0
+    assert seen==[12,12]

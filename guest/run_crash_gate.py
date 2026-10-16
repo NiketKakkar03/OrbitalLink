@@ -24,6 +24,10 @@ def main():
     args = parser.parse_args()
     output = args.output.resolve()
     output.mkdir(parents=True,exist_ok=False)
+    (output/'orbit-manifest.json').write_bytes((args.work/'output/images/orbit-manifest.json').read_bytes())
+    import hashlib
+    (output/'ground-source-sha256.json').write_text(json.dumps({str(p.relative_to(ROOT)):
+        hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted((ROOT/'ground').glob('*.py'))},indent=2)+'\n')
     credentials = output / 'credentials'
     generate(credentials)
     state = output / 'state.ext4'
@@ -62,6 +66,7 @@ def main():
                     raise RuntimeError('recovery ground readiness failed')
                 time.sleep(0.05)
             run_smoke(common+['--port',ready.read_text().strip(),'--sensors','--count','0',
+                '--storage-batch','16',
                 '--replay-count',str(len(expected)),'--artifacts',str(output/'replayed')],timeout=180)
             ground.wait(timeout=15)
             if ground.returncode:
@@ -81,7 +86,8 @@ def main():
             'precrash_committed_prefix':prefix['retained'],'recovered_committed_records':len(expected),
             'authenticated_ground_rows':len(samples),'phase_boots':3,
             'qemu_exit_signal':9,'scope':'guest VM power loss; host storage and Docker daemon remained running',
-            'storage_batch':1,'replay_summary':replay},indent=2)+'\n')
+            'storage_batch':1,'replay_storage_batch':16,'replay_drain_ms':3000,
+            'replay_summary':replay},indent=2)+'\n')
     except BaseException as error:
         (output/'result.json').write_text(json.dumps({'status':'failed','error':str(error)},indent=2)+'\n')
         raise

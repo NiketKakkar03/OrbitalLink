@@ -146,6 +146,10 @@ def main():
             console.wait(rb'\r?\nORBIT_CREDENTIALS_READY\r?\n', 20)
             console.send("mkdir -p /var/lib/orbit; blkid /dev/vdb | grep -q 'LABEL=\"orbit-state\"' && mount /dev/vdb /var/lib/orbit && printf '\\nORBIT_STATE_MOUNTED\\n'")
             console.wait(rb'\r?\nORBIT_STATE_MOUNTED\r?\n', 20)
+            console.send("grep ' /var/lib/orbit ' /proc/mounts; printf '\\nORBIT_STATE_OPTIONS_END\\n'")
+            mount_info = console.wait(rb'\r?\nORBIT_STATE_OPTIONS_END\r?\n', 10).string
+            if b'barrier=0' in mount_info or b'nobarrier' in mount_info:
+                raise RuntimeError('persistent state filesystem has write barriers disabled')
             probe_digest = None
             if args.outbox_probe:
                 probe = args.outbox_probe.read_bytes()

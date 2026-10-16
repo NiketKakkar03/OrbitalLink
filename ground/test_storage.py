@@ -1,9 +1,11 @@
 import sqlite3
+import time
 
 import pytest
 
 from ground.orbit_protocol import TelemetrySample
 from ground.orbit_storage import TelemetryStorage
+from ground import durable_test_profile
 
 
 def make_sample(**changes: int) -> TelemetrySample:
@@ -176,10 +178,11 @@ def test_command_results_are_idempotent(tmp_path):
     storage.close()
 
 
-def test_stores_ten_thousand_deterministic_samples_exactly(tmp_path):
+def test_stores_deterministic_samples_exactly(tmp_path):
+    sample_count = durable_test_profile.sample_count()
     storage = TelemetryStorage(tmp_path / "telemetry.db")
-
-    for sequence in range(10_000):
+    started = time.monotonic()
+    for sequence in range(sample_count):
         sample = make_sample(
             telemetry_sequence=sequence,
             device_sequence=sequence,
@@ -190,8 +193,8 @@ def test_stores_ten_thousand_deterministic_samples_exactly(tmp_path):
         assert storage.store_sample(sample, received_at_unix_ns=sequence) is True
 
     loaded = storage.load_samples()
-    assert storage.count_samples() == 10_000
-    assert len(loaded) == 10_000
+    assert storage.count_samples() == sample_count
+    assert len(loaded) == sample_count
     for sequence, sample in enumerate(loaded):
         assert sample == make_sample(
             telemetry_sequence=sequence,
@@ -201,4 +204,5 @@ def test_stores_ten_thousand_deterministic_samples_exactly(tmp_path):
             voltage_millivolts=3_300 + (sequence % 10),
         )
 
+    durable_test_profile.write_evidence(tmp_path / "result.json", storage, sample_count, sample_count, time.monotonic() - started)
     storage.close()

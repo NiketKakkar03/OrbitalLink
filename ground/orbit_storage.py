@@ -68,6 +68,7 @@ class TelemetryStorage:
 
     def __init__(self, database_path: str | Path):
         self.connection = sqlite3.connect(database_path)
+        self._batch_active = False
         try:
             # DELETE+EXTRA syncs the journal's directory after unlinking it.
             # FULL alone can roll back the latest commit after an OS power cut,
@@ -219,11 +220,37 @@ class TelemetryStorage:
                 ),
             )
             inserted = cursor.rowcount == 1
-            self.connection.commit()
+            if not self._batch_active:
+                self.connection.commit()
             return inserted
         except sqlite3.Error:
+            if not self._batch_active:
+                self.connection.rollback()
+            raise
+
+    def store_samples(self, records: list[tuple[TelemetrySample, bool, str | None]]) -> list[bool]:
+        """Commit1..16 received samples atomically; never wait to fill a batch.
+
+        Calls the existing per-record method so validation, duplicate handling,
+        and subclass fault injection retain their semantics. Its inner returns
+        are provisional; only this method's successful return permits ACKs.
+        """
+        if not 1 <= len(records) <= 16:
+            raise ValueError("sample batch must contain1..16 records")
+        if self._batch_active or self.connection.in_transaction:
+            raise RuntimeError("sample batch requires an idle storage connection")
+        self._batch_active = True
+        try:
+            self.connection.execute("BEGIN IMMEDIATE")
+            inserted = [self.store_sample(sample, physically_valid=valid, validity_reason=reason)
+                        for sample, valid, reason in records]
+            self.connection.commit()
+            return inserted
+        except Exception:
             self.connection.rollback()
             raise
+        finally:
+            self._batch_active = False
 
     def load_samples(self) -> list[TelemetrySample]:
         """Return samples in their unsigned telemetry-sequence order."""

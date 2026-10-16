@@ -49,6 +49,10 @@ def main():
     total = sum(expected.values())
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
+    (output / 'orbit-manifest.json').write_bytes((args.work / 'output/images/orbit-manifest.json').read_bytes())
+    import hashlib
+    (output / 'ground-source-sha256.json').write_text(json.dumps({str(p.relative_to(ROOT)):
+        hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted((ROOT/'ground').glob('*.py'))},indent=2)+'\n')
     credentials = output / 'credentials'
     generate(credentials)
     ready = output / 'ready'

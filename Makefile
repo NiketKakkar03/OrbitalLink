@@ -13,6 +13,10 @@ check: test-python test-cpp test-native-e2e test-recovery test-durable test-secu
 test-durable:
 	$(PYTHON) -m pytest ground/test_durable_e2e.py
 
+.PHONY: test-durable-stress
+test-durable-stress:
+	ORBIT_TEST_DURABLE_COUNT=10000 $(PYTHON) -m pytest ground/test_storage.py::test_stores_deterministic_samples_exactly ground/test_native_e2e.py::test_native_sender_persists_exact_samples_and_deduplicates
+
 test-security:
 	$(PYTHON) -m pytest ground/test_security_e2e.py ground/test_command_e2e.py ground/test_load_e2e.py
 
@@ -23,7 +27,7 @@ test-security-sanitizers:
 test-python:
 	$(PYTHON) -m json.tool protocol/fixtures/telemetry_sample_v1.json >/dev/null
 	$(PYTHON) -m json.tool protocol/fixtures/telemetry_ack_v1.json >/dev/null
-	$(PYTHON) -m pytest ground/test_temperature.py ground/test_protocol.py ground/test_storage.py ground/test_command_broker.py ground/test_command_cli.py ground/test_observability.py ground/test_sensor_telemetry.py
+	$(PYTHON) -m pytest ground/test_temperature.py ground/test_protocol.py ground/test_storage.py ground/test_command_broker.py ground/test_command_cli.py ground/test_observability.py ground/test_sensor_telemetry.py ground/test_durable_test_profile.py ground/test_receive_batch.py
 
 test-native-e2e:
 	$(PYTHON) -m pytest ground/test_native_e2e.py

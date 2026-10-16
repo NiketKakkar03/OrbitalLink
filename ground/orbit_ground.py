@@ -80,7 +80,58 @@ class GroundReceiver:
                 parser.finish()
                 return
 
-            for header, message in parser.feed(chunk):
+            frames=parser.feed(chunk)
+            telemetry_types=(TELEMETRY_SAMPLE,SENSOR_SAMPLE)
+            eof=False
+            # TLS commonly returns one application record per recv. Drain only
+            # bytes already available, with no batch-fill delay and a hard bound
+            # on additional socket calls. Partial parser state survives a WANT_READ.
+            if hasattr(connection,"gettimeout") and hasattr(connection,"settimeout"):
+                previous_timeout=connection.gettimeout()
+                try:
+                    connection.settimeout(0.0)
+                    queued=sum(header.message_type in telemetry_types for header,_ in frames)
+                    control=any(header.message_type not in telemetry_types for header,_ in frames)
+                    for _ in range(16):
+                        if queued>=16 or control:break
+                        try:
+                            available=connection.recv(64*1024)
+                        except (ssl.SSLWantReadError,ssl.SSLWantWriteError,BlockingIOError,TimeoutError):
+                            break
+                        if not available:
+                            eof=True;break
+                        parsed=parser.feed(available)
+                        frames.extend(parsed)
+                        queued+=sum(header.message_type in telemetry_types for header,_ in parsed)
+                        control=any(header.message_type not in telemetry_types for header,_ in parsed)
+                finally:
+                    connection.settimeout(previous_timeout)
+
+            pending=[]
+            def flush_samples():
+                if not pending:return
+                records=[(message,*classify_physical_validity(message)) for _,message in pending]
+                if hasattr(self._storage,"store_samples"):
+                    self._storage.store_samples(records)
+                else:
+                    for message,valid,reason in records:
+                        self._storage.store_sample(message,physically_valid=valid,validity_reason=reason)
+                # Every record is committed before the first batch ACK. A
+                # partial ACK write leaves durable rows safe for replay/dedup.
+                for header,message in pending:
+                    ack=TelemetryAck(message.spacecraft_id,message.flight_boot_id,message.telemetry_sequence)
+                    connection.sendall(encode_telemetry_ack(ack,header.message_sequence))
+                    self.receipts+=1
+                pending.clear()
+
+            for header, message in frames:
+                if header.message_type in (TELEMETRY_SAMPLE,SENSOR_SAMPLE) and isinstance(message,TelemetrySample):
+                    pending.append((header,message))
+                    if len(pending)==16:flush_samples()
+                    continue
+                # Control and loss frames keep their original ordering relative
+                # to telemetry, including their own commit-before-ACK boundary.
+                flush_samples()
                 if header.message_type == COMMAND_SESSION and isinstance(message, ControlMessage):
                     if self.broker: self.broker.open(*struct.unpack('!QQQ',message.payload))
                     continue
@@ -104,21 +155,10 @@ class GroundReceiver:
                 if header.message_type not in (TELEMETRY_SAMPLE, SENSOR_SAMPLE) or not isinstance(message, TelemetrySample):
                     raise ProtocolError("ground receiver expected telemetry sample")
 
-                # store_sample returns only after its transaction commits.  A
-                # duplicate is already durable, so it receives the same ACK.
-                physically_valid, validity_reason = classify_physical_validity(message)
-                self._storage.store_sample(
-                    message,
-                    physically_valid=physically_valid,
-                    validity_reason=validity_reason,
-                )
-                ack = TelemetryAck(
-                    spacecraft_id=message.spacecraft_id,
-                    flight_boot_id=message.flight_boot_id,
-                    telemetry_sequence=message.telemetry_sequence,
-                )
-                connection.sendall(encode_telemetry_ack(ack, header.message_sequence))
-                self.receipts += 1
+            flush_samples()
+            if eof:
+                parser.finish()
+                return
 
 
 def serve(

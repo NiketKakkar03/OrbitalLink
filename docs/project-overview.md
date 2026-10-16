@@ -285,8 +285,8 @@ a sustained-throughput benchmark. See [driver details](driver.md).
 | M4 security/control | Mutual TLS, identity authorization, native commands and replay/deadline policy tested |
 | M5 guest | Passed two real boots: 7 retained samples + 100 new = 107 ground rows across two boot IDs |
 | M6 driver test source | Passed syscall/lifecycle gate and 100 driver-origin TLS samples |
-| M7 custom peripheral | ABI2 hub/IRQ driver implemented; actual QTest, driver rebind contract and 600-second guest baseline passed; full roadmap acceptance remains separately tracked |
-| M8 fault/measurement | Native 600-second baseline and 100 Hz short measurement passed; overload/window/recovery tests expanded; full embedded fault matrix pending |
+| M7 custom peripheral | ABI2 hub/IRQ driver implemented; actual QTest, driver rebind contract, EXTRA-durable 600-second guest baseline and three abrupt-power-cut recoveries passed |
+| M8 fault/measurement | Native and embedded 600-second baselines passed; overload/window/recovery tests expanded; embedded 100 Hz limit measured; full fault matrix pending |
 | M9 release | Clean source tests and clean-checkout smoke passed; release, patch/license and operational work pending |
 
 The native suite includes protocol/storage, recovery, typed sensors, bounded
@@ -296,11 +296,12 @@ it does not yet rebuild and execute the entire guest/module matrix remotely.
 
 Validated implementation commit `3b3a7f0` passed
 [CI run 38752529854](https://github.com/NiketKakkar03/OrbitalLink/actions/runs/38752529854).
-The multisensor runtime correction `5f50e65` passed
-[CI run 38793706847](https://github.com/NiketKakkar03/OrbitalLink/actions/runs/38793706847)
-on Ubuntu and macOS. A separately identified embedded image passed a 600-second
-baseline with 6,060 reports, zero source/outbox drops and source-to-ACK p95 at
-most 48 ms. See
+The final multisensor implementation `66c3d6d` passed
+[CI run 38846899940](https://github.com/NiketKakkar03/OrbitalLink/actions/runs/38846899940)
+on Ubuntu and macOS. A separately identified embedded image passed an
+EXTRA-durable 600-second baseline with 6,060 reports, zero source/outbox drops
+and source-to-ACK p95 at most 389 ms. Three abrupt-power-cut cycles preserved and
+replayed every committed typed record. See
 [sensor validation](sensor-validation.md) for exact tested-image identities and
 the separate native and embedded results.
 Local embedded evidence is retained, ignored by Git, at:
@@ -310,6 +311,8 @@ Local embedded evidence is retained, ignored by Git, at:
   output and extracted syscall/lifecycle/kernel artifacts.
 - `build/guest-evidence/m7-baseline-001/`: custom-device contract, 600-second
   typed run, clock/resource measurements and image manifest.
+- `build/guest-evidence/m7-extra-baseline-001/`: final EXTRA-durable 600-second
+  typed run, raw serial/resource data, ground database and exact image manifest.
 
 These directories contain no copied private keys. They are local evidence,
 not a published release archive. Earlier failed attempts were preserved in the

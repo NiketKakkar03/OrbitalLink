@@ -32,7 +32,7 @@ Linux builder, with a fresh output directory for every attempt:
 
 ```sh
 python3 qemu/test_mmio.py --qemu /work/guest/output/host/bin/qemu-system-aarch64 --output /work/evidence/new-qtest
-python3 guest/run_m7_gate.py --work /work/guest --output /work/evidence/new-baseline --ticks 6000 --period-ms 100 --seed 1 --storage-batch 1
+python3 guest/run_m7_gate.py --work /work/guest --output /work/evidence/new-baseline --ticks 6000 --period-ms 100 --seed 1 --storage-batch 16
 ```
 
 The guest runner first checks the actual driver contract, including rebind,
@@ -76,6 +76,7 @@ useful, but they are not evidence that the old health counters were consistent.
 |30 seconds,100 routine Hz|`build/multisensor/performance-100hz-001/result.json`|3,030 stored;0 outbox drops;source-to-ACKp95<=27 ms|
 |30 seconds,100 routine Hz, corrected health counters|`build/multisensor/performance-100hz-final-001/result.json`|3,030 stored; zero drops; source-to-ACK p95 <=9 ms; exact health/category checks pass|
 |600 seconds,10 routine Hz, corrected health counters, pre-directory-sync fix|`build/multisensor/baseline-600s-final-001/result.json`|6,060 stored; zero drops; source-to-ACK p95 <=12 ms; exact health/category/resource checks pass|
+|600 seconds,10 routine Hz, EXTRA durability and bounded receipt batching|`build/multisensor/baseline-600s-extra-batched-final-001/result.json`|6,060 stored; zero drops/retained/reconnects; source-to-ACK p95 <=34 ms; exact health/category/resource checks pass|
 |Slow durable TLS receiver versus fast producer|`ground/test_load_e2e.py`|Capacity 32/window 8 stays bounded; intentional drops and their durable loss ACK counts reconcile; retained rows recover after the finite drain deadline|
 
 The 100 Hz result is a 30 second performance observation; it is not a 600 second
@@ -101,20 +102,33 @@ raw log in `posthoc-memory-validation.json`. Host wall time was 614.61 seconds,
 including boot and shutdown. Image and executable identities identify the
 actual tested build; later native-only counter fixes are not attributed to it.
 
-These baseline measurements used DELETE/FULL before the directory-sync fix;
-they establish healthy-link behavior, not power-cut retention. The first actual
+That earlier baseline used DELETE/FULL before the directory-sync fix; it
+establishes healthy-link behavior, not power-cut retention. The first actual
 VM power-cut gate (`build/guest-evidence/m7-crash-001/`) exposed a missing last
 commit: 115 records confirmed committed before SIGKILL, 114 after recovery.
 SQLite documents this DELETE/FULL limitation; EXTRA additionally synchronizes
 the journal-deletion directory. The failed artifact is preserved, and passing
-recovery must be established separately after tightening the storage setting.
+recovery was then established after tightening the storage setting.
 See [SQLite synchronous modes](https://www.sqlite.org/pragma.html#pragma_synchronous).
 
-An earlier short 100 Hz guest attempt failed: 15 outbox drops and source-to-ACK
-p95 around four seconds under per-record FULL storage transactions and TCG.
-That failure remains in the evidence. A passing native 100 Hz result does not
-establish the same embedded performance. Optional ACK batching is measured
-separately; it does not remove acquisition's per-record commit cost.
+The final EXTRA-synchronous embedded gate is retained at
+`build/guest-evidence/m7-extra-baseline-001/`. It passed all 6,060 reports with
+the exact category, value, health and event oracle; zero driver/outbox drops or
+retained records; and source-to-ACK p95 <=389 ms over all reports. Clock drift
+was 1,372 ns within a 1,069,368 ns budget. Its 61 RSS samples had about 0.53 MiB
+quarter-mean growth against the 32 MiB limit and a 10,555,392-byte peak. The
+profile used storage batch 16, send window 32 and priority scheduling.
+
+Three independent abrupt-power-cut cycles also passed under EXTRA: committed
+counts remained 119, 120 and 117 respectively across SIGKILL, reboot and
+authenticated replay, with byte-identical typed records and zero loss. The old
+115-to-114 FULL failure remains preserved as proof that this gate detects the
+problem it is intended to catch.
+
+The optional embedded 100 Hz comparison remains outside the supported profile.
+It acquired 3,030 reports but ACKed 656, retained 2,374 safely, and recorded
+10,477 driver drops while QEMU TCG stretched the intended 30-second acquisition
+to about 151 seconds. This is an honest capacity result, not data corruption.
 
 ## Transmission and priority behavior
 
@@ -162,14 +176,15 @@ and stable identities; a clean reboot alone is not an abrupt-power-loss test.
 
 ## Release preparation gates
 
-The runtime correction at `5f50e65` passed Ubuntu and macOS native, sanitizer,
+The final implementation at `66c3d6d` passed Ubuntu and macOS native, sanitizer,
 real-TLS sanitizer and supported macOS TSan checks in
-[CI run 38793706847](https://github.com/NiketKakkar03/OrbitalLink/actions/runs/38793706847).
+[CI run 38846899940](https://github.com/NiketKakkar03/OrbitalLink/actions/runs/38846899940).
 Guest evidence remains a separate local gate; CI does not execute QEMU endurance.
 
 Before calling this a release:
 
-- Finish and retain custom-device guest smoke/endurance and crash-recovery results.
+- Retain and independently reproduce the completed custom-device guest endurance
+  and crash-recovery results for a release candidate.
 - Run the native suite, ASan/UBSan, supported TSan and realTLS security checks for
   the final committed source; CI must pass on Ubuntu and macOS.
 - Reproduce from a clean source checkout, with exact source/patch/executable/image
@@ -192,8 +207,8 @@ Optional `--storage-batch 1..16` groups only already-arrived matching ACKs into
 one EXTRA-synchronous deletion transaction. Default 1 preserves single-record
 commit path. A batch never waits to become full. Unknown/duplicate ACKs retain
 unacknowledged samples; a valid prefix commits independently before reconnect.
-Acquisition still commits samples individually. The optimization does not imply
-a measured embedded throughput improvement until its comparison gate passes.
+Acquisition still commits samples individually. Batch 16 passed the supported
+10 Hz embedded gate; the 100 Hz comparison above shows its remaining limit.
 
 Both endpoints need type 9 support for multisensor exchange; no automatic
 downgrade discards category fields. Existing type 1 messages remain supported.

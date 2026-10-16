@@ -17,7 +17,7 @@ guest contract tests unbind/rebind while a file is open.
 
 Flight adds bounded windows, exact out-of-order ACK matching and category-based
 fair scheduling. Retained payloads remain immutable. Optional ACK batches commit
-only already-arrived matching receipts in one FULL SQLite transaction; acquisition
+only already-arrived matching receipts in one EXTRA SQLite transaction; acquisition
 still commits each sample individually. Valid ACK prefixes commit before a later
 bad receipt forces reconnection. Unit and real-process tests cover both batch
 sizes, rollback, disconnects, duplicates and unknown identities.
@@ -40,6 +40,15 @@ coverage. Its 61 RSS measurements passed the tightened memory oracle. The
 corrected native 100 Hz repeat also passed all 3,030 reports and consistent health
 snapshots, p95 at most 9 ms. Exact artifacts and the remaining batching/crash
 comparisons are tracked in the validation document.
+
+The final EXTRA-synchronous runs close the approved task. Native delivered all
+6,060 reports with source-to-ACK p95 <=34 ms. The actual QEMU/driver path also
+delivered all 6,060, with p95 <=389 ms, zero drops or retained records, bounded
+memory and valid clock calibration. Three abrupt SIGKILL/reboot cycles preserved
+every committed row and replayed byte-identical records. Bounded receipt batching
+made the stronger durability setting practical without waiting to fill a batch.
+The optional embedded 100 Hz comparison retained its backlog safely but exceeded
+the emulated platform's capacity, so 10 Hz remains the supported baseline.
 
 Overload verification uses a deterministic first-ACK barrier rather than assuming
 a particular SSD speed. A finite shutdown drain may leave committed telemetry or

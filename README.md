@@ -1,38 +1,193 @@
 # OrbitalLink
 
-OrbitalLink is a learning project that builds a secure embedded telemetry path in
-small milestones. Start with the [complete project walkthrough](docs/project-overview.md)
-for architecture, implemented behavior, validation evidence and remaining work.
-The implementation runs natively on macOS/Linux and inside an ARM64 Linux guest:
+OrbitalLink is a small embedded telemetry platform that models how a spacecraft
+could collect sensor readings, keep them safe during a network outage, and send
+them to a ground station.
+
+The project runs in two ways:
+
+- **Native mode** runs the flight software and ground station directly on macOS
+  or Linux. This is the quickest way to try the project.
+- **Embedded mode** boots an ARM64 Linux guest in QEMU. A custom virtual sensor
+  device raises interrupts, a Linux driver reads the measurements, and the
+  flight software sends them to the ground station.
+
+OrbitalLink uses simulated measurements and emulated hardware. It is an
+educational embedded-systems project, not flight-qualified spacecraft software.
+
+## Project overview
+
+The system has two main sides:
+
+1. The **flight side** collects power, temperature, orientation, health,
+   synthetic radiation, and event reports. It stores unsent reports in a
+   bounded SQLite outbox and sends them over an authenticated connection.
+2. The **ground side** checks each message, saves it in SQLite, and returns an
+   acknowledgement (ACK) only after the database commit succeeds.
+
+If the connection fails, the flight service reconnects and sends the retained
+reports again. Ground uses each report's identity to avoid storing duplicates.
+This provides retryable delivery while keeping memory and local storage bounded.
+
+The system also supports authenticated commands from ground, including enabling
+or disabling the sensor source, changing its reporting period, resetting it,
+clearing faults, and reading its current state.
+
+### What has been validated
+
+- A native integration test delivered 10,000 reports and replayed 100 duplicate
+  transmissions while ground stored exactly 10,000 unique rows.
+- The full QEMU device-to-ground path completed a 10-minute, 10 Hz run with
+  6,060 reports and no driver or outbox drops.
+- Abrupt VM power-cut tests verified that committed reports survived reboot and
+  were replayed with byte-identical contents.
+- Native tests run on macOS and Ubuntu and include protocol, storage, outage,
+  TLS, command, concurrency, and sanitizer checks.
+
+See [sensor validation](docs/sensor-validation.md) for the measured results and
+their limits.
+
+## Technology stack
+
+| Area | Tools and technologies | Purpose |
+|---|---|---|
+| Flight application | C++20, threads, SQLite | Collect, retain, and transmit telemetry |
+| Ground station | Python, SQLite | Receive, validate, store, and inspect telemetry |
+| Security | TLS 1.3, OpenSSL, mutual TLS | Authenticate both flight and ground |
+| Embedded platform | ARM64 Linux, Buildroot | Build and run the small guest system |
+| Virtual hardware | QEMU, MMIO, interrupts | Emulate a multisensor hardware device |
+| Linux interface | C kernel driver, character device, `read`/`poll`/`ioctl` | Move reports and commands between hardware and flight software |
+| Testing | Pytest, C/C++ tests, ASan, UBSan, TSan | Check behavior under normal and failure conditions |
+| Development | Make, Git, Docker | Build and reproduce the project |
+
+## Architecture
+
+The complete embedded path is:
 
 ```text
-C++ acquisition thread -> bounded retention queue -> C++ network thread
-    -> TLS/TCP -> Python ground station -> SQLite commit -> ACK
+Custom QEMU sensor device
+        |
+        | MMIO registers and interrupts
+        v
+Linux character driver
+        |
+        | read, poll, and ioctl
+        v
+C++ flight service
+  - acquisition thread
+  - bounded SQLite outbox
+  - network thread
+        |
+        | mutual TLS 1.3 over TCP
+        v
+Python ground station
+        |
+        | validate -> SQLite commit -> ACK
+        v
+Ground telemetry database
 ```
 
-The normal flight service and ground receiver use mutual TLS 1.3 with explicit
-peer identity authorization. See [security setup](docs/security.md) for the
-authenticated demo. The deterministic sender below uses the explicit loopback
-fixture transport retained for M2/M3 regression tests.
+The flight service separates sensor collection from networking. A slow or
+unavailable network therefore does not immediately stop collection. Before a
+report is sent, it is committed to the local outbox. It is removed only after
+ground confirms that the same report was committed successfully.
 
-## Verify the native implementation
+Storage is intentionally bounded. If an outage lasts long enough to fill the
+outbox, the system follows a defined priority and eviction policy and records
+the loss instead of allowing memory or disk use to grow without a limit. See
+the [retention policy](docs/retention.md) for details.
 
-Create the Python environment described in `docs/environment.md`, then run:
+## Run the project locally
+
+The native demo is the recommended starting point. It exercises the real C++
+flight service, Python ground station, TLS connection, durable outbox, ACKs, and
+SQLite storage. It does not boot QEMU or use the Linux kernel driver.
+
+### 1. Install the prerequisites
+
+You need:
+
+- Git and Make
+- Python 3.11 or newer
+- A C++20 compiler (Apple Clang or GCC)
+- OpenSSL 3 development files
+- SQLite development files
+
+On macOS with Homebrew:
+
+```bash
+brew install openssl@3 sqlite
+```
+
+On Ubuntu or Debian:
+
+```bash
+sudo apt update
+sudo apt install build-essential libssl-dev libsqlite3-dev python3-venv
+```
+
+### 2. Clone the repository and create the Python environment
+
+```bash
+git clone https://github.com/NiketKakkar03/OrbitalLink.git
+cd OrbitalLink
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+```
+
+Windows users should run the project through WSL2 or a Linux environment.
+
+### 3. Check the local setup
 
 ```bash
 make doctor
+```
+
+The command reports the detected compiler, Python, SQLite, OpenSSL, and any
+missing prerequisite.
+
+### 4. Run the automated authenticated demo
+
+```bash
+make demo-native
+```
+
+The demo:
+
+1. Compiles the C++ flight service.
+2. Creates short-lived development certificates.
+3. Starts the ground station and flight service.
+4. Sends 100 reports over mutual TLS 1.3.
+5. Verifies that all 100 reports were acknowledged and stored exactly once.
+6. Saves the database, logs, and result file under `build/native-demo/run-*`.
+
+At the end, copy the evidence directory printed after `Demo evidence:`. For
+example, if it prints `build/native-demo/run-example`, inspect that run with:
+
+```bash
+.venv/bin/python -m ground.orbit_ground \
+  --database build/native-demo/run-example/telemetry.db \
+  --status
+```
+
+Display the five most recent reports with a separate command:
+
+```bash
+.venv/bin/python -m ground.orbit_ground \
+  --database build/native-demo/run-example/telemetry.db \
+  --tail 5
+```
+
+Replace `run-example` with the directory created on your machine. Run each code
+block separately; do not append an inspection command to `make demo-native`.
+
+### 5. Run the complete native test suite
+
+```bash
 make check
 ```
 
-This validates shared protocol fixtures, Python storage and protocol behavior,
-C++ protocol behavior, compilation of the native sender, and the full native
-integration path. The integration test sends 10,000 deterministic samples,
-replays 100 duplicates, and verifies that SQLite contains exactly 10,000 rows.
-It also tests bounded queues, short and overflowing outages, lost and partial
-ACKs, a stalled peer, retry backoff, and bounded shutdown.
-Security tests use real TLS connections and disposable development certificates.
-
-Run the concurrency policy under the supported sanitizers separately:
+Additional concurrency and memory-safety checks are available separately:
 
 ```bash
 make test-sanitizers
@@ -40,21 +195,16 @@ make test-tsan
 make test-security-sanitizers
 ```
 
-Run the authenticated automated demo:
+Sanitizer availability depends on the compiler and operating system. See the
+[development environment guide](docs/environment.md) for platform notes.
 
-```bash
-make demo-native
-```
+## Run a simple two-terminal example
 
-It starts both native processes, verifies 100 acknowledged samples and their
-exact stored sequence set, and saves the database and process logs under
-`build/native-demo/`. See [security setup](docs/security.md) for manual TLS and
-operator-command use, and [validation evidence](docs/validation.md) for retained
-check results.
+This smaller example uses an explicit local plaintext test mode so the data flow
+is easy to observe. Production-style flight builds use TLS and do not silently
+fall back to plaintext.
 
-## Run the native path manually
-
-In one terminal, start the ground receiver:
+In the first terminal, start ground:
 
 ```bash
 .venv/bin/python -m ground.orbit_ground \
@@ -63,7 +213,7 @@ In one terminal, start the ground receiver:
   --port 9000
 ```
 
-In another terminal, compile and run the flight sender:
+In a second terminal, compile and run the deterministic sample sender:
 
 ```bash
 c++ -std=c++20 -Wall -Wextra -Werror \
@@ -71,114 +221,62 @@ c++ -std=c++20 -Wall -Wextra -Werror \
 /tmp/orbit-send-sample 127.0.0.1 9000 10
 ```
 
-Stop the receiver with Ctrl-C. Inspect the database through the textual CLI:
+Stop ground with `Ctrl-C`, then inspect the stored reports:
 
 ```bash
-.venv/bin/python -m ground.orbit_ground --database /tmp/orbit-telemetry.db --status
-.venv/bin/python -m ground.orbit_ground --database /tmp/orbit-telemetry.db --tail 5
-.venv/bin/python -m ground.orbit_ground --database /tmp/orbit-telemetry.db \
-  --export /tmp/orbit-telemetry.jsonl
+.venv/bin/python -m ground.orbit_ground \
+  --database /tmp/orbit-telemetry.db \
+  --status
+
+.venv/bin/python -m ground.orbit_ground \
+  --database /tmp/orbit-telemetry.db \
+  --tail 5
 ```
 
-The receiver sends an ACK only after SQLite commits a sample. Retransmitted
-samples are not inserted twice, but are ACKed because their existing row is
-already durable. Structurally valid but physically implausible readings remain
-stored with a validity flag and reason; malformed protocol frames are rejected.
+## Run the ARM64/QEMU version
 
-## Run the concurrent flight service
+The embedded setup is optional and considerably heavier than the native demo.
+It uses Docker Desktop as an ARM64 Linux builder, compiles Buildroot, Linux,
+QEMU, the driver, and the flight service, and then boots a separate ARM64 guest.
+The first build requires substantial time and disk space.
 
-With the TLS receiver and disposable certificates described in
-`docs/security.md`, compile and start the concurrent service:
+Start with the [ARM64 guest setup](docs/guest.md). After the image is built, the
+embedded validation runner can boot the virtual hardware and verify the complete
+device-to-ground path. Use a new output directory for every evidence run:
 
 ```bash
-make test-cpp
-/tmp/orbit_flight_service 127.0.0.1 9000 \
-  --outbox /tmp/orbit-flight-outbox.db \
-  --ca /tmp/orbit-certificates/ca.pem \
-  --cert /tmp/orbit-certificates/flight.pem \
-  --key /tmp/orbit-certificates/flight.key \
-  --server-name ground.orbital.test \
-  --count 100 \
-  --interval-ms 100 \
-  --capacity 1024
+python3 guest/run_m7_gate.py \
+  --work /work/guest \
+  --output /work/evidence/my-m7-run \
+  --ticks 6000 \
+  --period-ms 100 \
+  --seed 1 \
+  --storage-batch 16
 ```
 
-The default generation rate is 10 samples per second. Normal flight builds require
-a SQLite outbox and default to a 64 MiB total storage budget; `--outbox-bytes`
-changes that budget and `--capacity` adds an optional record-count limit.
-Old queued samples are dropped when retention fills, while an in-flight sample
-stays protected until its matching ACK. The memory-only regression fixture keeps
-its original 1,024 queued samples plus a separately bounded in-flight frame.
+This is a 10-minute measurement run in addition to guest boot and shutdown time.
+The native demo is better for a quick introduction; the QEMU gate is the proof
+that the custom device, Linux driver, and ARM64 flight image work together.
 
-Each service run generates a fresh random 64-bit boot identity so restarted
-sequence numbers remain distinct in SQLite. Persisted samples replay with their
-original identities and payloads. Explicit boot-ID overrides are limited to the
-plaintext regression fixture. The small `send_sample` fixture tool retains a
-fixed identity for deterministic duplicate tests.
+## Project documentation
 
-The service prints one final JSON object containing counters such as:
+- [Complete project walkthrough](docs/project-overview.md)
+- [Native development environment](docs/environment.md)
+- [Security and authenticated commands](docs/security.md)
+- [ARM64 guest setup](docs/guest.md)
+- [Linux driver](docs/driver.md)
+- [Wire protocol](protocol/specification.md)
+- [Sensor contract](protocol/sensor-contract.md)
+- [Retention and outage behavior](docs/retention.md)
+- [Validation evidence](docs/validation.md)
+- [Multisensor measurements](docs/sensor-validation.md)
 
-```text
-generated, acknowledged, dropped_oldest, discarded_shutdown,
-connect_attempts, connect_failures, reconnects, transmission_attempts,
-retransmissions, queue_high_watermark, gap_ranges
-```
+## Scope and limitations
 
-The memory-only fixture accounts at shutdown as:
-
-```text
-generated = acknowledged + dropped_oldest + discarded_shutdown
-```
-
-Durable totals persist across runs and satisfy:
-
-```text
-durable_generated = durable_acknowledged + durable_dropped + durable_retained
-```
-
-Current-run ACKs may include samples recovered from earlier runs; use the durable
-totals to reconcile a restarted service. Storage failures produce an explicit
-failure exit and preserve whatever remains committed in the outbox.
-
-Overflow losses are also recorded in a separate bounded gap summary. Consecutive
-telemetry sequences coalesce into ranges. Up to 16 ranges retain details; after
-that, the summary keeps an exact omitted-loss count and marks its detailed report
-incomplete instead of allocating memory without a bound.
-
-Normal flight also persists bounded loss reports, retransmits immutable report
-identities, and removes them only after ground commits and ACKs them. Ground
-deduplicates reports and rejects conflicting payloads under an existing identity.
-When detailed ranges fill, bounded summaries preserve exact loss counts while
-marking the missing range detail. See [retention policy](docs/retention.md).
-
-Connection retries begin at 250 ms, double to a five-second cap, include bounded
-jitter, and reset after a successful ACK. Socket operations use nonblocking I/O
-and deadlines. SIGINT or SIGTERM stops acquisition, attempts a bounded drain,
-accounts for every remaining sample, closes descriptors, and joins both threads
-within the three-second external shutdown contract on responsive storage.
-Uninterruptible filesystem I/O can delay a durable-service shutdown; the native
-network tests do not establish a hard deadline under failing storage hardware.
-
-Committed telemetry and loss reports survive a flight-process restart. An
-indefinite outage still exceeds finite storage: old queued samples are dropped
-with durable loss accounting. Disk corruption, hardware failure, or a filesystem
-that does not honor synchronization remain outside that guarantee.
-
-## Embedded milestone gates
-
-Native M4 is implemented and locally validated; see
-[the M4 journal](docs/journal/session-004.md) for results and limitations.
-The ARM64 cross-toolchain, kernel and complete image build pass in the Linux
-builder on Apple Silicon; see [guest setup](docs/guest.md).
-Guest boot and two-boot persistent replay passed: seven retained samples plus
-100 new samples reached durable ground storage over mutual TLS.
-The [driver test backend and flight adapter](docs/driver.md) passed the Linux
-syscall suite, 100 lifecycle cycles and a 100-sample driver-to-ground TLS gate.
-The `feature/multisensor-validation` branch adds a custom QEMU MMIO/IRQ hub and
-ABI2 driver, with power, thermal, orientation, health, synthetic radiation and
-event reports. Shared deterministic interactions include eclipse, heater changes
-and a pointing disturbance that pauses science collection. Legacy records remain
-supported. See [sensor validation](docs/sensor-validation.md) for the 10-minute
-baseline, separate native/embedded measurements, priority retention, bounded send
-window and remaining fault/release gates. Native results establish the host path;
-custom-device results require their own guest evidence.
+OrbitalLink demonstrates embedded data flow, driver interfaces, durable retry,
+authenticated networking, and failure testing. It does not connect to a
+physical spacecraft, radio, or sensor board. Sensor values are deterministic
+examples rather than calibrated physics, and the custom network protocol is not
+CCSDS. Production deployment would also require operational certificate
+management, dependency patch auditing, database archival, and hardware-specific
+qualification.
